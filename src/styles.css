@@ -31,6 +31,11 @@ button {
   cursor: default;
 }
 
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
 .app-shell {
   display: grid;
   grid-template-columns: 264px 7px 1fr;
@@ -271,10 +276,89 @@ button {
   border-bottom: 1px solid #ece8df;
 }
 
+.path-form,
+.extension-editor,
+.scan-status,
+.scan-errors {
+  padding: 12px 16px;
+  border-bottom: 1px solid #ece8df;
+}
+
+.path-form {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: end;
+  gap: 8px;
+}
+
+.path-form label,
+.extension-editor label {
+  display: grid;
+  gap: 6px;
+  color: #667172;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.path-form input,
+.extension-editor textarea {
+  width: 100%;
+  border: 1px solid #d8d3c8;
+  border-radius: 7px;
+  color: #263033;
+  background: #ffffff;
+  font: inherit;
+  font-weight: 400;
+  text-transform: none;
+}
+
+.path-form input {
+  height: 36px;
+  padding: 0 10px;
+}
+
+.path-form button,
+.tree-action {
+  min-height: 36px;
+  padding: 0 12px;
+  border: 1px solid #d8d3c8;
+  border-radius: 7px;
+  color: #263033;
+  background: #ffffff;
+}
+
+.extension-editor textarea {
+  min-height: 70px;
+  max-height: 116px;
+  padding: 9px 10px;
+  resize: vertical;
+}
+
+.scan-status {
+  display: grid;
+  gap: 3px;
+  color: #263033;
+}
+
+.scan-status span,
+.scan-errors span {
+  color: #667172;
+  font-size: 12px;
+}
+
+.scan-errors {
+  display: grid;
+  gap: 5px;
+  max-height: 96px;
+  overflow: auto;
+}
+
 .tree {
-  height: calc(100% - 118px);
+  max-height: 31%;
   overflow: auto;
   padding: 8px;
+  border-bottom: 1px solid #ece8df;
 }
 
 .tree-row {
@@ -288,6 +372,11 @@ button {
 
 .tree-row:hover {
   background: #f3f0e8;
+}
+
+.tree-action {
+  margin: 0 10px 8px 58px;
+  color: #8a4538;
 }
 
 .tree-copy {
@@ -344,6 +433,7 @@ button {
   gap: 12px;
   padding: 16px;
   overflow: auto;
+  min-height: 210px;
 }
 
 .media-card {
@@ -351,6 +441,10 @@ button {
   border: 1px solid #d8d3c8;
   border-radius: 8px;
   background: #fbfaf7;
+}
+
+.media-card.missing {
+  opacity: 0.68;
 }
 
 .thumb {
@@ -430,4 +524,21 @@ button {
   padding: 9px 10px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.empty-state {
+  display: grid;
+  min-height: 82px;
+  place-items: center;
+  padding: 16px;
+  color: #667172;
+  text-align: center;
+}
+
+.empty-state.wide {
+  grid-column: 1 / -1;
+  min-height: 160px;
+  border: 1px dashed #d8d3c8;
+  border-radius: 8px;
+  background: #fbfaf7;
 }
