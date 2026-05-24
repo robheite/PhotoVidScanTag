@@ -540,7 +540,7 @@ button:disabled {
 
 .media-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(184px, 1fr));
   align-content: start;
   flex: 1 1 auto;
   gap: 12px;
@@ -550,6 +550,7 @@ button:disabled {
 }
 
 .media-card {
+  contain: content;
   overflow: hidden;
   border: 1px solid #d8d3c8;
   border-radius: 8px;
@@ -568,7 +569,7 @@ button:disabled {
 .thumb {
   position: relative;
   display: grid;
-  height: 132px;
+  height: 124px;
   place-items: center;
   color: #ffffff;
   background:
@@ -630,11 +631,18 @@ button:disabled {
 
 .data-grid {
   flex: 0 0 auto;
-  max-height: 230px;
-  margin: 0 16px 16px;
+  max-height: 210px;
+  margin: 0 16px 10px;
   overflow: auto;
   border: 1px solid #d8d3c8;
   border-radius: 8px;
+}
+
+.preview-limit {
+  flex: 0 0 auto;
+  margin: 0 16px 10px;
+  color: #667172;
+  font-size: 12px;
 }
 
 .data-grid-row {

@@ -73,9 +73,16 @@ type ScanRoot = {
   updatedAtUnix: number;
 };
 
+type ScanFolder = {
+  path: string;
+  scanRoot: string;
+  missing: boolean;
+  lastSeenScanId: number;
+};
+
 type FolderNode = {
   label: string;
-  path?: string;
+  path: string;
   count: number;
   children: FolderNode[];
 };
@@ -96,10 +103,8 @@ function TreeRow({
   onToggleSelected: (node: FolderNode) => void;
 }) {
   const hasChildren = node.children.length > 0;
-  const nodePath = node.path ?? node.label;
-  const isExpanded = expandedFolderPaths.includes(nodePath);
-  const nodePaths = collectNodePaths([node]);
-  const isChecked = nodePaths.every((path: string) => selectedFolderPaths.includes(path));
+  const isExpanded = expandedFolderPaths.includes(node.path);
+  const isChecked = selectedFolderPaths.includes(node.path);
   return (
     <>
       <div className="tree-row" style={{ paddingLeft: 10 + depth * 18 }}>
@@ -126,7 +131,7 @@ function TreeRow({
       {isExpanded
         ? node.children.map((child) => (
             <TreeRow
-              key={child.path ?? `${node.label}-${child.label}`}
+              key={child.path}
               node={child}
               depth={depth + 1}
               expandedFolderPaths={expandedFolderPaths}
@@ -147,6 +152,7 @@ function App() {
   const [fileTypesExpanded, setFileTypesExpanded] = useState(false);
   const [mediaFiles, setMediaFiles] = useState<MediaFile[]>([]);
   const [scanRoots, setScanRoots] = useState<ScanRoot[]>([]);
+  const [scanFolders, setScanFolders] = useState<ScanFolder[]>([]);
   const [tags, setTags] = useState<TagSummary[]>([]);
   const [scanResult, setScanResult] = useState<ScanResponse | null>(null);
   const [status, setStatus] = useState("Ready");
@@ -164,8 +170,9 @@ function App() {
 
   const extensionGroups = useMemo(() => groupExtensions(availableExtensions), [availableExtensions]);
 
-  const folderTree = useMemo(() => buildFolderTree(scanPaths, mediaFiles), [scanPaths, mediaFiles]);
+  const folderTree = useMemo(() => buildFolderTree(scanPaths, scanFolders, mediaFiles), [scanPaths, scanFolders, mediaFiles]);
   const allFolderPaths = useMemo(() => collectNodePaths(folderTree), [folderTree]);
+  const selectedFolderSet = useMemo(() => new Set(selectedFolderPaths), [selectedFolderPaths]);
   const activeFolderFilterCount = allFolderPaths.length
     ? selectedFolderPaths.filter((path: string) => allFolderPaths.includes(path)).length
     : 0;
@@ -183,7 +190,7 @@ function App() {
   const visibleMediaFiles = useMemo(() => {
     const query = searchText.trim().toLowerCase();
     const folderFilteredFiles = allFolderPaths.length
-      ? mediaFiles.filter((file) => selectedFolderPaths.some((folderPath) => isPathInside(file.path, folderPath)))
+      ? mediaFiles.filter((file) => selectedFolderSet.has(fileFolderPath(file.path)))
       : mediaFiles;
     const tagFilteredFiles = selectedTagFilter
       ? folderFilteredFiles.filter((file) => file.tags.includes(selectedTagFilter))
@@ -199,25 +206,30 @@ function App() {
         .toLowerCase()
         .includes(query)
     );
-  }, [allFolderPaths.length, mediaFiles, searchText, selectedFolderPaths, selectedTagFilter]);
+  }, [allFolderPaths.length, mediaFiles, searchText, selectedFolderSet, selectedTagFilter]);
+
+  const previewMediaFiles = useMemo(() => visibleMediaFiles.slice(0, 72), [visibleMediaFiles]);
+  const gridMediaFiles = useMemo(() => visibleMediaFiles.slice(0, 250), [visibleMediaFiles]);
 
   const configuredRootCount = Math.max(scanPaths.length, scanRoots.length);
 
   async function initializeAppData() {
     try {
-      const [defaultExtensions, files, roots, savedTags] = await Promise.all([
+      const [defaultExtensions, files, roots, folders, savedTags] = await Promise.all([
         invoke<string[]>("supported_extensions"),
         invoke<MediaFile[]>("list_media"),
         invoke<ScanRoot[]>("list_scan_roots"),
+        invoke<ScanFolder[]>("list_scan_folders"),
         invoke<TagSummary[]>("list_tags")
       ]);
       setAvailableExtensions(defaultExtensions);
       setSelectedExtensions((current) => (current.length ? current : defaultExtensions));
       setMediaFiles(files);
       setScanRoots(roots);
+      setScanFolders(folders);
       setTags(savedTags);
       setScanPaths((current) => (current.length ? current : roots.map((root) => root.path)));
-      const initialTree = buildFolderTree(roots.map((root) => root.path), files);
+      const initialTree = buildFolderTree(roots.map((root) => root.path), folders, files);
       setSelectedFolderPaths(collectNodePaths(initialTree));
       setExpandedFolderPaths(roots.map((root) => root.path));
       setStatus(files.length ? `Loaded ${files.length.toLocaleString()} cached files` : "Ready to scan");
@@ -264,13 +276,15 @@ function App() {
       });
       const files = await invoke<MediaFile[]>("list_media");
       const roots = await invoke<ScanRoot[]>("list_scan_roots");
+      const folders = await invoke<ScanFolder[]>("list_scan_folders");
       const savedTags = await invoke<TagSummary[]>("list_tags");
       setScanResult(result);
       setMediaFiles(files);
       setScanRoots(roots);
+      setScanFolders(folders);
       setTags(savedTags);
       setSelectedFileIds([]);
-      const nextTree = buildFolderTree(scanPaths, files);
+      const nextTree = buildFolderTree(scanPaths, folders, files);
       setSelectedFolderPaths(collectNodePaths(nextTree));
       setExpandedFolderPaths(scanPaths);
       setStatus(
@@ -351,11 +365,10 @@ function App() {
   }
 
   function toggleFolderExpanded(node: FolderNode) {
-    const nodePath = node.path ?? node.label;
     setExpandedFolderPaths((currentPaths) =>
-      currentPaths.includes(nodePath)
-        ? currentPaths.filter((path) => path !== nodePath)
-        : [...currentPaths, nodePath]
+      currentPaths.includes(node.path)
+        ? currentPaths.filter((path) => path !== node.path)
+        : [...currentPaths, node.path]
     );
   }
 
@@ -515,7 +528,7 @@ function App() {
             <div className="tree">
               {folderTree.length ? (
                 folderTree.map((node) => (
-                  <div className="tree-root" key={node.path ?? node.label}>
+                  <div className="tree-root" key={node.path}>
                     <TreeRow
                       node={node}
                       expandedFolderPaths={expandedFolderPaths}
@@ -655,7 +668,7 @@ function App() {
 
             <div className="media-grid">
               {visibleMediaFiles.length ? (
-                visibleMediaFiles.map((item) => (
+                previewMediaFiles.map((item) => (
                   <article
                     className={`media-card ${item.missing ? "missing" : ""} ${
                       selectedFileIds.includes(item.id) ? "selected" : ""
@@ -693,6 +706,11 @@ function App() {
                 <div className="empty-state wide">No media files found yet. Add a path and start a scan.</div>
               )}
             </div>
+            {visibleMediaFiles.length > previewMediaFiles.length ? (
+              <div className="preview-limit">
+                Showing first {previewMediaFiles.length} previews for responsiveness. Use search, tags, or folder selection to narrow the view.
+              </div>
+            ) : null}
 
             <div className="data-grid" role="table" aria-label="Detailed media results">
               <div className="data-grid-row header" role="row">
@@ -703,7 +721,7 @@ function App() {
                 <span>Date taken</span>
                 <span>Path</span>
               </div>
-              {visibleMediaFiles.map((item) => (
+              {gridMediaFiles.map((item) => (
                 <div
                   className={`data-grid-row ${selectedFileIds.includes(item.id) ? "selected" : ""}`}
                   role="row"
@@ -727,6 +745,11 @@ function App() {
                 </div>
               ))}
             </div>
+            {visibleMediaFiles.length > gridMediaFiles.length ? (
+              <div className="preview-limit">
+                Showing first {gridMediaFiles.length} rows.
+              </div>
+            ) : null}
           </section>
         </div>
 
@@ -737,6 +760,7 @@ function App() {
           </div>
           <div className="status-details">
             <span>{visibleMediaFiles.length.toLocaleString()} visible</span>
+            <span>{previewMediaFiles.length.toLocaleString()} previews loaded</span>
             <span>{mediaFiles.length.toLocaleString()} cached</span>
             <span>{selectedFileIds.length.toLocaleString()} selected</span>
             <span>
@@ -787,20 +811,29 @@ function canPreviewExtension(extension: string) {
   return ["jpg", "jpeg", "png", "gif", "bmp", "tif", "tiff", "webp"].includes(extension.toLowerCase());
 }
 
-function buildFolderTree(scanPaths: string[], mediaFiles: MediaFile[]) {
+function buildFolderTree(scanPaths: string[], scanFolders: ScanFolder[], mediaFiles: MediaFile[]) {
+  const countByFolder = new Map<string, number>();
+  for (const file of mediaFiles) {
+    const folderPath = fileFolderPath(file.path);
+    countByFolder.set(folderPath, (countByFolder.get(folderPath) ?? 0) + 1);
+  }
+
   return scanPaths.map((rootPath) => {
     const root: FolderNode = {
       label: folderLabel(rootPath),
       path: rootPath,
-      count: 0,
+      count: countFilesUnderFolder(rootPath, countByFolder),
       children: []
     };
 
-    const filesForRoot = mediaFiles.filter((file) => file.scanRoot === rootPath);
-    for (const file of filesForRoot) {
-      root.count += 1;
-      const relative = relativePath(rootPath, file.path);
-      const folderParts = relative.split(/[\\/]/).slice(0, -1).filter(Boolean);
+    const foldersForRoot = scanFolders
+      .filter((folder) => folder.scanRoot === rootPath)
+      .map((folder) => folder.path)
+      .filter((folderPath) => folderPath !== rootPath);
+
+    for (const folderPath of foldersForRoot) {
+      const relative = relativePath(rootPath, folderPath);
+      const folderParts = relative.split(/[\\/]/).filter(Boolean);
       let current = root;
       let currentPath = rootPath;
 
@@ -811,12 +844,11 @@ function buildFolderTree(scanPaths: string[], mediaFiles: MediaFile[]) {
           child = {
             label: folderPart,
             path: currentPath,
-            count: 0,
+            count: countFilesUnderFolder(currentPath, countByFolder),
             children: []
           };
           current.children.push(child);
         }
-        child.count += 1;
         current = child;
       }
     }
@@ -824,6 +856,16 @@ function buildFolderTree(scanPaths: string[], mediaFiles: MediaFile[]) {
     sortFolderTree(root);
     return root;
   });
+}
+
+function countFilesUnderFolder(folderPath: string, countByFolder: Map<string, number>) {
+  let count = 0;
+  for (const [fileFolder, folderCount] of countByFolder) {
+    if (fileFolder === folderPath || isPathInside(fileFolder, folderPath)) {
+      count += folderCount;
+    }
+  }
+  return count;
 }
 
 function sortFolderTree(node: FolderNode) {
@@ -854,6 +896,12 @@ function relativePath(rootPath: string, filePath: string) {
   }
 
   return filePath;
+}
+
+function fileFolderPath(filePath: string) {
+  const parts = filePath.split(/[\\/]/);
+  parts.pop();
+  return parts.join(filePath.includes("\\") ? "\\" : "/");
 }
 
 function joinDisplayPath(parent: string, child: string) {

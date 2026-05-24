@@ -65,6 +65,15 @@ struct ScanRoot {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct ScanFolder {
+    path: String,
+    scan_root: String,
+    missing: bool,
+    last_seen_scan_id: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct TagSummary {
     id: i64,
     name: String,
@@ -145,6 +154,9 @@ fn scan_media(request: ScanRequest, state: State<'_, AppState>) -> Result<ScanRe
         )
         .map_err(|error| error.to_string())?;
 
+        cache_scan_folder(&conn, &root_path, &root_string, scan_run_id)
+            .map_err(|error| error.to_string())?;
+
         for entry in WalkDir::new(&root_path).follow_links(false).into_iter() {
             let entry = match entry {
                 Ok(entry) => entry,
@@ -153,6 +165,13 @@ fn scan_media(request: ScanRequest, state: State<'_, AppState>) -> Result<ScanRe
                     continue;
                 }
             };
+
+            if entry.file_type().is_dir() {
+                if let Err(error) = cache_scan_folder(&conn, entry.path(), &root_string, scan_run_id) {
+                    response.errors.push(format!("{}: {error}", entry.path().display()));
+                }
+                continue;
+            }
 
             if !entry.file_type().is_file() {
                 continue;
@@ -178,6 +197,13 @@ fn scan_media(request: ScanRequest, state: State<'_, AppState>) -> Result<ScanRe
 
         conn.execute(
             "UPDATE media_files
+             SET missing = 1
+             WHERE scan_root = ?1 AND last_seen_scan_id != ?2",
+            params![root_string, scan_run_id],
+        )
+        .map_err(|error| error.to_string())?;
+        conn.execute(
+            "UPDATE scan_folders
              SET missing = 1
              WHERE scan_root = ?1 AND last_seen_scan_id != ?2",
             params![root_string, scan_run_id],
@@ -390,6 +416,40 @@ fn list_scan_roots(state: State<'_, AppState>) -> Result<Vec<ScanRoot>, String> 
         .map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+fn list_scan_folders(state: State<'_, AppState>) -> Result<Vec<ScanFolder>, String> {
+    let db_path = state
+        .db_path
+        .lock()
+        .map_err(|_| "Database state is unavailable".to_string())?
+        .clone();
+    let conn = Connection::open(db_path).map_err(|error| error.to_string())?;
+    init_db(&conn).map_err(|error| error.to_string())?;
+
+    let mut statement = conn
+        .prepare(
+            "SELECT path, scan_root, missing, last_seen_scan_id
+             FROM scan_folders
+             WHERE missing = 0
+             ORDER BY scan_root ASC, path ASC",
+        )
+        .map_err(|error| error.to_string())?;
+
+    let rows = statement
+        .query_map([], |row| {
+            Ok(ScanFolder {
+                path: row.get(0)?,
+                scan_root: row.get(1)?,
+                missing: row.get::<_, i64>(2)? == 1,
+                last_seen_scan_id: row.get(3)?,
+            })
+        })
+        .map_err(|error| error.to_string())?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
 fn init_db(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "
@@ -402,6 +462,13 @@ fn init_db(conn: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS scan_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             started_at_unix INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS scan_folders (
+            path TEXT PRIMARY KEY NOT NULL,
+            scan_root TEXT NOT NULL,
+            missing INTEGER NOT NULL DEFAULT 0,
+            last_seen_scan_id INTEGER NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS media_files (
@@ -443,8 +510,28 @@ fn init_db(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_media_missing ON media_files(missing);
         CREATE INDEX IF NOT EXISTS idx_media_date_taken ON media_files(date_taken_unix);
         CREATE INDEX IF NOT EXISTS idx_file_tags_tag_id ON file_tags(tag_id);
+        CREATE INDEX IF NOT EXISTS idx_scan_folders_root ON scan_folders(scan_root);
         ",
     )
+}
+
+fn cache_scan_folder(
+    conn: &Connection,
+    path: &Path,
+    scan_root: &str,
+    scan_run_id: i64,
+) -> rusqlite::Result<()> {
+    let path_string = path.to_string_lossy().to_string();
+    conn.execute(
+        "INSERT INTO scan_folders (path, scan_root, missing, last_seen_scan_id)
+         VALUES (?1, ?2, 0, ?3)
+         ON CONFLICT(path) DO UPDATE SET
+            scan_root = excluded.scan_root,
+            missing = 0,
+            last_seen_scan_id = excluded.last_seen_scan_id",
+        params![path_string, scan_root, scan_run_id],
+    )?;
+    Ok(())
 }
 
 fn query_tags(conn: &Connection) -> Result<Vec<TagSummary>, String> {
@@ -666,6 +753,7 @@ pub fn run() {
             scan_media,
             list_media,
             list_scan_roots,
+            list_scan_folders,
             list_tags,
             apply_tags,
             remove_tag_from_files
