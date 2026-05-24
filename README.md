@@ -30,3 +30,11 @@ Tauri desktop development, after Rust is installed:
 ```powershell
 npm run tauri dev
 ```
+
+Windows desktop build:
+
+```powershell
+cmd /c tools\tauri-build-windows.cmd
+```
+
+The Windows helper loads the Visual Studio C++ build environment, adds Cargo to `PATH`, then runs the Tauri build. This is needed when building from a normal shell instead of a Visual Studio Developer Command Prompt.

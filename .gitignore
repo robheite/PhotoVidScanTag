@@ -4,6 +4,7 @@ node_modules/
 # Build output
 dist/
 src-tauri/target/
+src-tauri/gen/schemas/
 
 # Logs
 *.log
@@ -27,3 +28,7 @@ Thumbs.db
 data/
 *.sqlite
 *.sqlite3
+
+# Local installers used for toolchain setup
+rustup-init.exe
+vs_BuildTools.exe
