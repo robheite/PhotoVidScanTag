@@ -25,12 +25,17 @@ import {
 import { useEffect, useMemo, useState } from "react";
 
 const sections = [
-  { label: "Scan", icon: ScanSearch, active: true },
-  { label: "Library", icon: Grid3X3 },
-  { label: "Duplicates", icon: Hash },
-  { label: "Move/Copy", icon: MoveRight },
-  { label: "Settings", icon: Settings }
+  { label: "Scan", icon: ScanSearch, enabled: true },
+  { label: "Library", icon: Grid3X3, enabled: true },
+  { label: "Duplicates", icon: Hash, enabled: false },
+  { label: "Move/Copy", icon: MoveRight, enabled: false },
+  { label: "Settings", icon: Settings, enabled: false }
 ];
+
+const scanPreviewLimit = 50;
+const thumbnailSizes = ["small", "medium", "large"] as const;
+type AppSection = "Scan" | "Library";
+type ThumbnailSize = (typeof thumbnailSizes)[number];
 
 type MediaFile = {
   id: number;
@@ -163,6 +168,8 @@ function App() {
   const [selectedTagFilter, setSelectedTagFilter] = useState<string | null>(null);
   const [expandedFolderPaths, setExpandedFolderPaths] = useState<string[]>([]);
   const [selectedFolderPaths, setSelectedFolderPaths] = useState<string[]>([]);
+  const [activeSection, setActiveSection] = useState<AppSection>("Scan");
+  const [thumbnailSize, setThumbnailSize] = useState<ThumbnailSize>("medium");
 
   useEffect(() => {
     void initializeAppData();
@@ -208,8 +215,11 @@ function App() {
     );
   }, [allFolderPaths.length, mediaFiles, searchText, selectedFolderSet, selectedTagFilter]);
 
-  const previewMediaFiles = useMemo(() => visibleMediaFiles.slice(0, 72), [visibleMediaFiles]);
+  const previewMediaFiles = useMemo(() => visibleMediaFiles.slice(0, scanPreviewLimit), [visibleMediaFiles]);
+  const libraryMediaFiles = visibleMediaFiles;
   const gridMediaFiles = useMemo(() => visibleMediaFiles.slice(0, 250), [visibleMediaFiles]);
+  const activePreviewFiles = activeSection === "Library" ? libraryMediaFiles : previewMediaFiles;
+  const activePreviewLabel = activeSection === "Library" ? "Library" : "Scan preview";
 
   const configuredRootCount = Math.max(scanPaths.length, scanRoots.length);
 
@@ -398,12 +408,18 @@ function App() {
         <nav className="section-nav" aria-label="Application sections">
           {sections.map((section) => {
             const Icon = section.icon;
+            const isActive = activeSection === section.label;
             return (
               <button
-                className={section.active ? "active" : ""}
-                disabled={!section.active}
-                title={section.active ? undefined : "This section is not built yet."}
+                className={isActive ? "active" : ""}
+                disabled={!section.enabled}
+                title={section.enabled ? undefined : "This section is not built yet."}
                 key={section.label}
+                onClick={() => {
+                  if (section.enabled) {
+                    setActiveSection(section.label as AppSection);
+                  }
+                }}
               >
                 <Icon size={18} />
                 {section.label}
@@ -449,8 +465,12 @@ function App() {
       <section className="workspace">
         <header className="topbar">
           <div>
-            <h1>Scan</h1>
-            <p>Choose folders or drives, refresh cached results, and keep missing files visible for review.</p>
+            <h1>{activeSection}</h1>
+            <p>
+              {activeSection === "Scan"
+                ? "Choose folders or drives, refresh cached results, and keep missing files visible for review."
+                : "Browse the full visible library, review previews, and apply tags from one place."}
+            </p>
           </div>
           <div className="topbar-actions">
             <button className="secondary-button" onClick={initializeAppData} disabled={isScanning}>
@@ -487,7 +507,9 @@ function App() {
           </div>
         </section>
 
-        <div className="content-split">
+        <div className={activeSection === "Scan" ? "content-split" : "content-single"}>
+          {activeSection === "Scan" ? (
+            <>
           <section className="panel tree-panel">
             <div className="panel-header">
               <div>
@@ -607,17 +629,34 @@ function App() {
           </section>
 
           <div className="resize-rail subtle" aria-hidden="true" />
+            </>
+          ) : null}
 
-          <section className="panel library-panel">
+          <section className={`panel library-panel ${activeSection === "Library" ? "library-full" : ""}`}>
             <div className="panel-header">
               <div>
-                <h2>Library Preview</h2>
-                <p>System thumbnails first, fallback icons when unavailable.</p>
+                <h2>{activePreviewLabel}</h2>
+                <p>
+                  {activeSection === "Library"
+                    ? "Full visible media set with larger previews and the same tagging controls."
+                    : `First ${scanPreviewLimit} visible files with full-fit thumbnails for a fast scan review.`}
+                </p>
               </div>
               <div className="view-actions">
-                <button className="icon-button" aria-label="Grid view">
+                <button className="icon-button" aria-label="Grid view" title="Grid view">
                   <Grid3X3 size={18} />
                 </button>
+                <div className="size-toggle" aria-label="Thumbnail size">
+                  {thumbnailSizes.map((size) => (
+                    <button
+                      className={thumbnailSize === size ? "active" : ""}
+                      key={size}
+                      onClick={() => setThumbnailSize(size)}
+                    >
+                      {size}
+                    </button>
+                  ))}
+                </div>
                 <button className="icon-button" aria-label="Detailed list" disabled title="View toggle is not built yet.">
                   <ListFilter size={18} />
                 </button>
@@ -666,9 +705,9 @@ function App() {
               </button>
             </div>
 
-            <div className="media-grid">
+            <div className={`media-grid thumb-size-${thumbnailSize}`}>
               {visibleMediaFiles.length ? (
-                previewMediaFiles.map((item) => (
+                activePreviewFiles.map((item) => (
                   <article
                     className={`media-card ${item.missing ? "missing" : ""} ${
                       selectedFileIds.includes(item.id) ? "selected" : ""
@@ -706,9 +745,9 @@ function App() {
                 <div className="empty-state wide">No media files found yet. Add a path and start a scan.</div>
               )}
             </div>
-            {visibleMediaFiles.length > previewMediaFiles.length ? (
+            {activeSection === "Scan" && visibleMediaFiles.length > previewMediaFiles.length ? (
               <div className="preview-limit">
-                Showing first {previewMediaFiles.length} previews for responsiveness. Use search, tags, or folder selection to narrow the view.
+                Showing first {previewMediaFiles.length} previews here. Open Library to browse all {visibleMediaFiles.length.toLocaleString()} visible files.
               </div>
             ) : null}
 
@@ -760,7 +799,7 @@ function App() {
           </div>
           <div className="status-details">
             <span>{visibleMediaFiles.length.toLocaleString()} visible</span>
-            <span>{previewMediaFiles.length.toLocaleString()} previews loaded</span>
+            <span>{activePreviewFiles.length.toLocaleString()} previews loaded</span>
             <span>{mediaFiles.length.toLocaleString()} cached</span>
             <span>{selectedFileIds.length.toLocaleString()} selected</span>
             <span>
