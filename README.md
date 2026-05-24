@@ -4,6 +4,8 @@ MediaTagger is a local-first desktop app for scanning, tagging, reviewing, de-du
 
 The app is planned as a Tauri desktop application with a React/TypeScript frontend, Rust backend, and SQLite cache/database.
 
+Repository: `robheite/PhotoVidScanTag`
+
 ## Current Status
 
 Initial scaffold and product plan are in progress.
