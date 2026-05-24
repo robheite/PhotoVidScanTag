@@ -104,7 +104,9 @@ function TreeRow({ node, depth = 0 }: { node: FolderNode; depth?: number }) {
 
 function App() {
   const [scanPaths, setScanPaths] = useState<string[]>([]);
-  const [extensionInput, setExtensionInput] = useState("");
+  const [availableExtensions, setAvailableExtensions] = useState<string[]>([]);
+  const [selectedExtensions, setSelectedExtensions] = useState<string[]>([]);
+  const [fileTypesExpanded, setFileTypesExpanded] = useState(false);
   const [mediaFiles, setMediaFiles] = useState<MediaFile[]>([]);
   const [scanRoots, setScanRoots] = useState<ScanRoot[]>([]);
   const [tags, setTags] = useState<TagSummary[]>([]);
@@ -120,14 +122,7 @@ function App() {
     void initializeAppData();
   }, []);
 
-  const extensions = useMemo(
-    () =>
-      extensionInput
-        .split(",")
-        .map((extension) => extension.trim().replace(/^\./, "").toLowerCase())
-        .filter(Boolean),
-    [extensionInput]
-  );
+  const extensionGroups = useMemo(() => groupExtensions(availableExtensions), [availableExtensions]);
 
   const visibleMediaFiles = useMemo(() => {
     const query = searchText.trim().toLowerCase();
@@ -158,7 +153,8 @@ function App() {
         invoke<ScanRoot[]>("list_scan_roots"),
         invoke<TagSummary[]>("list_tags")
       ]);
-      setExtensionInput((current) => current || defaultExtensions.join(", "));
+      setAvailableExtensions(defaultExtensions);
+      setSelectedExtensions((current) => (current.length ? current : defaultExtensions));
       setMediaFiles(files);
       setScanRoots(roots);
       setTags(savedTags);
@@ -201,7 +197,7 @@ function App() {
     setStatus("Scanning selected paths...");
     try {
       const result = await invoke<ScanResponse>("scan_media", {
-        request: { paths: scanPaths, extensions }
+        request: { paths: scanPaths, extensions: selectedExtensions }
       });
       const files = await invoke<MediaFile[]>("list_media");
       const roots = await invoke<ScanRoot[]>("list_scan_roots");
@@ -250,6 +246,22 @@ function App() {
     setMediaFiles(files);
     setTagInput("");
     setStatus(`Applied ${tagNames.length} tag${tagNames.length === 1 ? "" : "s"} to ${selectedFileIds.length} file(s)`);
+  }
+
+  function toggleExtension(extension: string) {
+    setSelectedExtensions((current) =>
+      current.includes(extension)
+        ? current.filter((selected) => selected !== extension)
+        : [...current, extension].sort((left, right) => left.localeCompare(right))
+    );
+  }
+
+  function selectAllExtensions() {
+    setSelectedExtensions([...availableExtensions]);
+  }
+
+  function deselectAllExtensions() {
+    setSelectedExtensions([]);
   }
 
   return (
@@ -406,11 +418,45 @@ function App() {
               )}
             </div>
 
-            <div className="extension-editor">
-              <label>
-                Included extensions
-                <textarea value={extensionInput} onChange={(event) => setExtensionInput(event.target.value)} />
-              </label>
+            <div className="extension-panel">
+              <button
+                className="extension-panel-header"
+                onClick={() => setFileTypesExpanded((expanded) => !expanded)}
+                aria-expanded={fileTypesExpanded}
+              >
+                <span>
+                  <strong>File Types</strong>
+                  <small>
+                    {selectedExtensions.length} of {availableExtensions.length} enabled
+                  </small>
+                </span>
+                {fileTypesExpanded ? <ChevronDown size={16} /> : <Folder size={16} />}
+              </button>
+              {fileTypesExpanded ? (
+                <div className="extension-panel-body">
+                  <div className="extension-actions">
+                    <button onClick={selectAllExtensions}>Select all</button>
+                    <button onClick={deselectAllExtensions}>Deselect all</button>
+                  </div>
+                  {extensionGroups.map((group) => (
+                    <div className="extension-group" key={group.label}>
+                      <strong>{group.label}</strong>
+                      <div className="extension-checkboxes">
+                        {group.extensions.map((extension) => (
+                          <label key={extension}>
+                            <input
+                              type="checkbox"
+                              checked={selectedExtensions.includes(extension)}
+                              onChange={() => toggleExtension(extension)}
+                            />
+                            .{extension}
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
             </div>
 
             <div className="scan-status">
@@ -663,6 +709,33 @@ function relativePath(rootPath: string, filePath: string) {
 function joinDisplayPath(parent: string, child: string) {
   const separator = parent.includes("\\") ? "\\" : "/";
   return `${parent.replace(/[\\/]+$/, "")}${separator}${child}`;
+}
+
+function groupExtensions(extensions: string[]) {
+  const groups = [
+    {
+      label: "Photos",
+      extensions: ["jpg", "jpeg", "png", "gif", "bmp", "tif", "tiff", "webp", "heic", "heif"]
+    },
+    {
+      label: "Video",
+      extensions: ["mov", "m4v", "mp4", "avi", "mkv", "mpg", "mpeg", "webm"]
+    },
+    {
+      label: "RAW / Camera",
+      extensions: ["dng", "nef", "nrw", "arw", "srf", "sr2", "cr2", "cr3", "raf", "orf", "rw2", "pef"]
+    }
+  ];
+  const known = new Set(groups.flatMap((group) => group.extensions));
+  const custom = extensions.filter((extension) => !known.has(extension));
+
+  return [
+    ...groups.map((group) => ({
+      ...group,
+      extensions: group.extensions.filter((extension) => extensions.includes(extension))
+    })),
+    custom.length ? { label: "Other", extensions: custom } : null
+  ].filter((group): group is { label: string; extensions: string[] } => Boolean(group && group.extensions.length));
 }
 
 export { App };

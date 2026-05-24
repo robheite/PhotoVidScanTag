@@ -282,7 +282,7 @@ button:disabled {
 }
 
 .path-form,
-.extension-editor,
+.extension-panel,
 .scan-status,
 .scan-errors {
   padding: 12px 16px;
@@ -310,8 +310,7 @@ button:disabled {
   font-size: 12px;
 }
 
-.path-form label,
-.extension-editor label {
+.path-form label {
   display: grid;
   gap: 6px;
   color: #667172;
@@ -320,8 +319,7 @@ button:disabled {
   text-transform: uppercase;
 }
 
-.path-form input,
-.extension-editor textarea {
+.path-form input {
   width: 100%;
   border: 1px solid #d8d3c8;
   border-radius: 7px;
@@ -351,17 +349,79 @@ button:disabled {
   background: #ffffff;
 }
 
-.extension-editor textarea {
-  min-height: 70px;
-  max-height: 116px;
-  padding: 9px 10px;
-  resize: vertical;
-}
-
 .scan-status {
   display: grid;
   gap: 3px;
   color: #263033;
+}
+
+.extension-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.extension-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  min-height: 40px;
+  padding: 0;
+  text-align: left;
+  background: transparent;
+}
+
+.extension-panel-header span {
+  display: grid;
+  gap: 3px;
+}
+
+.extension-panel-header strong,
+.extension-group strong {
+  font-size: 13px;
+}
+
+.extension-panel-header small {
+  color: #667172;
+  font-size: 12px;
+}
+
+.extension-panel-body {
+  display: grid;
+  gap: 12px;
+}
+
+.extension-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.extension-actions button {
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid #d8d3c8;
+  border-radius: 7px;
+  background: #ffffff;
+}
+
+.extension-group {
+  display: grid;
+  gap: 7px;
+}
+
+.extension-checkboxes {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(80px, 1fr));
+  gap: 6px;
+}
+
+.extension-checkboxes label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  color: #263033;
+  font-size: 12px;
 }
 
 .scan-status span,
