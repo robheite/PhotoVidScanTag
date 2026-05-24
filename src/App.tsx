@@ -80,24 +80,62 @@ type FolderNode = {
   children: FolderNode[];
 };
 
-function TreeRow({ node, depth = 0 }: { node: FolderNode; depth?: number }) {
+function TreeRow({
+  node,
+  depth = 0,
+  expandedFolderPaths,
+  selectedFolderPaths,
+  onToggleExpanded,
+  onToggleSelected
+}: {
+  node: FolderNode;
+  depth?: number;
+  expandedFolderPaths: string[];
+  selectedFolderPaths: string[];
+  onToggleExpanded: (node: FolderNode) => void;
+  onToggleSelected: (node: FolderNode) => void;
+}) {
   const hasChildren = node.children.length > 0;
+  const nodePath = node.path ?? node.label;
+  const isExpanded = expandedFolderPaths.includes(nodePath);
+  const nodePaths = collectNodePaths([node]);
+  const isChecked = nodePaths.every((path: string) => selectedFolderPaths.includes(path));
   return (
     <>
       <div className="tree-row" style={{ paddingLeft: 10 + depth * 18 }}>
-        <button className="icon-button small" aria-label="Folder">
-          {hasChildren ? <ChevronDown size={16} /> : <Folder size={16} />}
+        <button
+          className="icon-button small"
+          aria-label={isExpanded ? "Collapse folder" : "Expand folder"}
+          onClick={() => onToggleExpanded(node)}
+          disabled={!hasChildren}
+        >
+          {hasChildren ? <ChevronDown className={isExpanded ? "" : "chevron-collapsed"} size={16} /> : <Folder size={16} />}
         </button>
-        <input type="checkbox" checked readOnly aria-label={`Select ${node.label}`} />
+        <input
+          type="checkbox"
+          checked={isChecked}
+          onChange={() => onToggleSelected(node)}
+          aria-label={`Select ${node.label}`}
+        />
         <div className="tree-copy">
           <span>{node.label}</span>
           {node.path ? <small>{node.path}</small> : null}
         </div>
         <small className="tree-count">{node.count}</small>
       </div>
-      {node.children.map((child) => (
-        <TreeRow key={child.path ?? `${node.label}-${child.label}`} node={child} depth={depth + 1} />
-      ))}
+      {isExpanded
+        ? node.children.map((child) => (
+            <TreeRow
+              key={child.path ?? `${node.label}-${child.label}`}
+              node={child}
+              depth={depth + 1}
+              expandedFolderPaths={expandedFolderPaths}
+              selectedFolderPaths={selectedFolderPaths}
+              onToggleExpanded={onToggleExpanded}
+              onToggleSelected={onToggleSelected}
+            />
+          ))
+        : null}
     </>
   );
 }
@@ -117,6 +155,8 @@ function App() {
   const [selectedFileIds, setSelectedFileIds] = useState<number[]>([]);
   const [tagInput, setTagInput] = useState("");
   const [selectedTagFilter, setSelectedTagFilter] = useState<string | null>(null);
+  const [expandedFolderPaths, setExpandedFolderPaths] = useState<string[]>([]);
+  const [selectedFolderPaths, setSelectedFolderPaths] = useState<string[]>([]);
 
   useEffect(() => {
     void initializeAppData();
@@ -124,15 +164,34 @@ function App() {
 
   const extensionGroups = useMemo(() => groupExtensions(availableExtensions), [availableExtensions]);
 
-  const visibleMediaFiles = useMemo(() => {
-    const query = searchText.trim().toLowerCase();
-    if (!query) {
-      return mediaFiles;
+  const folderTree = useMemo(() => buildFolderTree(scanPaths, mediaFiles), [scanPaths, mediaFiles]);
+  const allFolderPaths = useMemo(() => collectNodePaths(folderTree), [folderTree]);
+  const activeFolderFilterCount = allFolderPaths.length
+    ? selectedFolderPaths.filter((path: string) => allFolderPaths.includes(path)).length
+    : 0;
+  const activeFileTypeLabel = `${selectedExtensions.length}/${availableExtensions.length || 0} file types`;
+
+  useEffect(() => {
+    if (!allFolderPaths.length) {
+      return;
     }
 
-    const tagFilteredFiles = selectedTagFilter
-      ? mediaFiles.filter((file) => file.tags.includes(selectedTagFilter))
+    setSelectedFolderPaths((currentPaths) => mergeKnownPaths(currentPaths, allFolderPaths));
+    setExpandedFolderPaths((currentPaths) => (currentPaths.length ? currentPaths : scanPaths));
+  }, [allFolderPaths, scanPaths]);
+
+  const visibleMediaFiles = useMemo(() => {
+    const query = searchText.trim().toLowerCase();
+    const folderFilteredFiles = allFolderPaths.length
+      ? mediaFiles.filter((file) => selectedFolderPaths.some((folderPath) => isPathInside(file.path, folderPath)))
       : mediaFiles;
+    const tagFilteredFiles = selectedTagFilter
+      ? folderFilteredFiles.filter((file) => file.tags.includes(selectedTagFilter))
+      : folderFilteredFiles;
+
+    if (!query) {
+      return tagFilteredFiles;
+    }
 
     return tagFilteredFiles.filter((file) =>
       [file.filename, file.extension, file.mediaType, file.path, file.scanRoot]
@@ -140,9 +199,8 @@ function App() {
         .toLowerCase()
         .includes(query)
     );
-  }, [mediaFiles, searchText, selectedTagFilter]);
+  }, [allFolderPaths.length, mediaFiles, searchText, selectedFolderPaths, selectedTagFilter]);
 
-  const folderTree = useMemo(() => buildFolderTree(scanPaths, mediaFiles), [scanPaths, mediaFiles]);
   const configuredRootCount = Math.max(scanPaths.length, scanRoots.length);
 
   async function initializeAppData() {
@@ -159,6 +217,9 @@ function App() {
       setScanRoots(roots);
       setTags(savedTags);
       setScanPaths((current) => (current.length ? current : roots.map((root) => root.path)));
+      const initialTree = buildFolderTree(roots.map((root) => root.path), files);
+      setSelectedFolderPaths(collectNodePaths(initialTree));
+      setExpandedFolderPaths(roots.map((root) => root.path));
       setStatus(files.length ? `Loaded ${files.length.toLocaleString()} cached files` : "Ready to scan");
     } catch (error) {
       setStatus(`Desktop backend unavailable: ${String(error)}`);
@@ -181,6 +242,8 @@ function App() {
       ...currentPaths,
       ...selectedPaths.filter((path) => !currentPaths.includes(path))
     ]);
+    setSelectedFolderPaths((currentPaths) => [...new Set([...currentPaths, ...selectedPaths])]);
+    setExpandedFolderPaths((currentPaths) => [...new Set([...currentPaths, ...selectedPaths])]);
   }
 
   function removeScanPath(path: string) {
@@ -207,6 +270,9 @@ function App() {
       setScanRoots(roots);
       setTags(savedTags);
       setSelectedFileIds([]);
+      const nextTree = buildFolderTree(scanPaths, files);
+      setSelectedFolderPaths(collectNodePaths(nextTree));
+      setExpandedFolderPaths(scanPaths);
       setStatus(
         `Scan complete: ${result.scannedFiles.toLocaleString()} processed, ${result.skippedUnchanged.toLocaleString()} unchanged`
       );
@@ -262,6 +328,45 @@ function App() {
 
   function deselectAllExtensions() {
     setSelectedExtensions([]);
+  }
+
+  function expandAllFolders() {
+    setExpandedFolderPaths(allFolderPaths);
+  }
+
+  function collapseAllFolders() {
+    setExpandedFolderPaths([]);
+  }
+
+  function expandTopLevelFolders() {
+    setExpandedFolderPaths(scanPaths);
+  }
+
+  function selectAllFolders() {
+    setSelectedFolderPaths(allFolderPaths);
+  }
+
+  function deselectAllFolders() {
+    setSelectedFolderPaths([]);
+  }
+
+  function toggleFolderExpanded(node: FolderNode) {
+    const nodePath = node.path ?? node.label;
+    setExpandedFolderPaths((currentPaths) =>
+      currentPaths.includes(nodePath)
+        ? currentPaths.filter((path) => path !== nodePath)
+        : [...currentPaths, nodePath]
+    );
+  }
+
+  function toggleFolderSelected(node: FolderNode) {
+    const nodePaths = collectNodePaths([node]);
+    const shouldDeselect = nodePaths.every((path) => selectedFolderPaths.includes(path));
+    setSelectedFolderPaths((currentPaths) =>
+      shouldDeselect
+        ? currentPaths.filter((path) => !nodePaths.includes(path))
+        : [...new Set([...currentPaths, ...nodePaths])]
+    );
   }
 
   return (
@@ -379,14 +484,20 @@ function App() {
               <FolderTree size={20} />
             </div>
             <div className="toolbar">
-              <button disabled title="Folder expansion controls are coming next.">
+              <button onClick={expandAllFolders} disabled={!folderTree.length}>
                 Expand all
               </button>
-              <button disabled title="Folder expansion controls are coming next.">
+              <button onClick={collapseAllFolders} disabled={!folderTree.length}>
                 Collapse all
               </button>
-              <button disabled title="Folder expansion controls are coming next.">
+              <button onClick={expandTopLevelFolders} disabled={!folderTree.length}>
                 Level 1
+              </button>
+              <button onClick={selectAllFolders} disabled={!folderTree.length}>
+                Select all
+              </button>
+              <button onClick={deselectAllFolders} disabled={!folderTree.length}>
+                Deselect
               </button>
             </div>
 
@@ -405,7 +516,13 @@ function App() {
               {folderTree.length ? (
                 folderTree.map((node) => (
                   <div className="tree-root" key={node.path ?? node.label}>
-                    <TreeRow node={node} />
+                    <TreeRow
+                      node={node}
+                      expandedFolderPaths={expandedFolderPaths}
+                      selectedFolderPaths={selectedFolderPaths}
+                      onToggleExpanded={toggleFolderExpanded}
+                      onToggleSelected={toggleFolderSelected}
+                    />
                     {node.path ? (
                       <button className="tree-action" onClick={() => removeScanPath(node.path as string)}>
                         Remove path
@@ -612,6 +729,23 @@ function App() {
             </div>
           </section>
         </div>
+
+        <footer className="status-bar" aria-live="polite">
+          <div className="status-primary">
+            <span className={`status-dot ${isScanning ? "active" : ""}`} />
+            <strong>{status}</strong>
+          </div>
+          <div className="status-details">
+            <span>{visibleMediaFiles.length.toLocaleString()} visible</span>
+            <span>{mediaFiles.length.toLocaleString()} cached</span>
+            <span>{selectedFileIds.length.toLocaleString()} selected</span>
+            <span>
+              {activeFolderFilterCount}/{allFolderPaths.length} folders
+            </span>
+            <span>{activeFileTypeLabel}</span>
+            {selectedTagFilter ? <span>tag: {selectedTagFilter}</span> : null}
+          </div>
+        </footer>
       </section>
     </main>
   );
@@ -695,6 +829,22 @@ function buildFolderTree(scanPaths: string[], mediaFiles: MediaFile[]) {
 function sortFolderTree(node: FolderNode) {
   node.children.sort((left, right) => left.label.localeCompare(right.label));
   node.children.forEach(sortFolderTree);
+}
+
+function collectNodePaths(nodes: FolderNode[]): string[] {
+  return nodes.flatMap((node) => [node.path ?? node.label, ...collectNodePaths(node.children)]);
+}
+
+function mergeKnownPaths(currentPaths: string[], knownPaths: string[]) {
+  const filtered = currentPaths.filter((path) => knownPaths.includes(path));
+  const additions = knownPaths.filter((path) => !filtered.includes(path));
+  return [...filtered, ...additions];
+}
+
+function isPathInside(filePath: string, folderPath: string) {
+  const normalizedFilePath = filePath.toLowerCase();
+  const normalizedFolderPath = folderPath.replace(/[\\/]+$/, "").toLowerCase();
+  return normalizedFilePath === normalizedFolderPath || normalizedFilePath.startsWith(`${normalizedFolderPath}\\`) || normalizedFilePath.startsWith(`${normalizedFolderPath}/`);
 }
 
 function relativePath(rootPath: string, filePath: string) {

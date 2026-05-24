@@ -166,7 +166,7 @@ button:disabled {
 .workspace {
   display: flex;
   flex-direction: column;
-  gap: 18px;
+  gap: 14px;
   min-width: 0;
   padding: 22px;
   overflow: hidden;
@@ -264,6 +264,11 @@ button:disabled {
   border: 1px solid #d8d3c8;
   border-radius: 8px;
   background: #ffffff;
+}
+
+.tree-panel {
+  display: flex;
+  flex-direction: column;
 }
 
 .panel-header {
@@ -446,7 +451,8 @@ button:disabled {
 }
 
 .tree {
-  max-height: 31%;
+  flex: 1;
+  min-height: 120px;
   overflow: auto;
   padding: 8px;
   border-bottom: 1px solid #ece8df;
@@ -473,6 +479,10 @@ button:disabled {
 .tree-count {
   padding-right: 10px;
   color: #667172;
+}
+
+.chevron-collapsed {
+  transform: rotate(-90deg);
 }
 
 .tree-copy {
@@ -531,10 +541,12 @@ button:disabled {
 .media-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  align-content: start;
+  flex: 1 1 auto;
   gap: 12px;
+  min-height: 0;
   padding: 16px;
   overflow: auto;
-  min-height: 210px;
 }
 
 .media-card {
@@ -617,8 +629,10 @@ button:disabled {
 }
 
 .data-grid {
+  flex: 0 0 auto;
+  max-height: 230px;
   margin: 0 16px 16px;
-  overflow: hidden;
+  overflow: auto;
   border: 1px solid #d8d3c8;
   border-radius: 8px;
 }
@@ -668,4 +682,67 @@ button:disabled {
   border: 1px dashed #d8d3c8;
   border-radius: 8px;
   background: #fbfaf7;
+}
+
+.status-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  min-height: 38px;
+  padding: 0 12px;
+  border: 1px solid #d8d3c8;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.status-primary,
+.status-details {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.status-primary {
+  gap: 8px;
+}
+
+.status-primary strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+
+.status-details {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px 12px;
+  color: #667172;
+  font-size: 12px;
+}
+
+.status-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  background: #5e6f57;
+}
+
+.status-dot.active {
+  animation: pulse-status 1s infinite ease-in-out;
+  background: #2e625f;
+}
+
+@keyframes pulse-status {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(0.86);
+  }
+
+  50% {
+    opacity: 1;
+    transform: scale(1);
+  }
 }
