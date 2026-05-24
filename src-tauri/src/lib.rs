@@ -54,6 +54,14 @@ struct MediaFile {
     scanned_at_unix: i64,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScanRoot {
+    path: String,
+    enabled: bool,
+    updated_at_unix: i64,
+}
+
 #[tauri::command]
 fn health_check() -> &'static str {
     "ok"
@@ -207,6 +215,38 @@ fn list_media(state: State<'_, AppState>) -> Result<Vec<MediaFile>, String> {
                 megapixels,
                 missing: row.get::<_, i64>(13)? == 1,
                 scanned_at_unix: row.get(14)?,
+            })
+        })
+        .map_err(|error| error.to_string())?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn list_scan_roots(state: State<'_, AppState>) -> Result<Vec<ScanRoot>, String> {
+    let db_path = state
+        .db_path
+        .lock()
+        .map_err(|_| "Database state is unavailable".to_string())?
+        .clone();
+    let conn = Connection::open(db_path).map_err(|error| error.to_string())?;
+    init_db(&conn).map_err(|error| error.to_string())?;
+
+    let mut statement = conn
+        .prepare(
+            "SELECT path, enabled, updated_at_unix
+             FROM scan_roots
+             ORDER BY path ASC",
+        )
+        .map_err(|error| error.to_string())?;
+
+    let rows = statement
+        .query_map([], |row| {
+            Ok(ScanRoot {
+                path: row.get(0)?,
+                enabled: row.get::<_, i64>(1)? == 1,
+                updated_at_unix: row.get(2)?,
             })
         })
         .map_err(|error| error.to_string())?;
@@ -410,6 +450,7 @@ fn unix_now() -> i64 {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let app_data_dir = app
                 .path()
@@ -428,7 +469,8 @@ pub fn run() {
             health_check,
             supported_extensions,
             scan_media,
-            list_media
+            list_media,
+            list_scan_roots
         ])
         .run(tauri::generate_context!())
         .expect("error while running MediaTagger");
