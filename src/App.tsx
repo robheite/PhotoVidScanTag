@@ -50,6 +50,13 @@ type MediaFile = {
   megapixels: number | null;
   missing: boolean;
   scannedAtUnix: number;
+  tags: string[];
+};
+
+type TagSummary = {
+  id: number;
+  name: string;
+  fileCount: number;
 };
 
 type ScanResponse = {
@@ -100,10 +107,14 @@ function App() {
   const [extensionInput, setExtensionInput] = useState("");
   const [mediaFiles, setMediaFiles] = useState<MediaFile[]>([]);
   const [scanRoots, setScanRoots] = useState<ScanRoot[]>([]);
+  const [tags, setTags] = useState<TagSummary[]>([]);
   const [scanResult, setScanResult] = useState<ScanResponse | null>(null);
   const [status, setStatus] = useState("Ready");
   const [isScanning, setIsScanning] = useState(false);
   const [searchText, setSearchText] = useState("");
+  const [selectedFileIds, setSelectedFileIds] = useState<number[]>([]);
+  const [tagInput, setTagInput] = useState("");
+  const [selectedTagFilter, setSelectedTagFilter] = useState<string | null>(null);
 
   useEffect(() => {
     void initializeAppData();
@@ -124,27 +135,33 @@ function App() {
       return mediaFiles;
     }
 
-    return mediaFiles.filter((file) =>
+    const tagFilteredFiles = selectedTagFilter
+      ? mediaFiles.filter((file) => file.tags.includes(selectedTagFilter))
+      : mediaFiles;
+
+    return tagFilteredFiles.filter((file) =>
       [file.filename, file.extension, file.mediaType, file.path, file.scanRoot]
         .join(" ")
         .toLowerCase()
         .includes(query)
     );
-  }, [mediaFiles, searchText]);
+  }, [mediaFiles, searchText, selectedTagFilter]);
 
   const folderTree = useMemo(() => buildFolderTree(scanPaths, mediaFiles), [scanPaths, mediaFiles]);
   const configuredRootCount = Math.max(scanPaths.length, scanRoots.length);
 
   async function initializeAppData() {
     try {
-      const [defaultExtensions, files, roots] = await Promise.all([
+      const [defaultExtensions, files, roots, savedTags] = await Promise.all([
         invoke<string[]>("supported_extensions"),
         invoke<MediaFile[]>("list_media"),
-        invoke<ScanRoot[]>("list_scan_roots")
+        invoke<ScanRoot[]>("list_scan_roots"),
+        invoke<TagSummary[]>("list_tags")
       ]);
       setExtensionInput((current) => current || defaultExtensions.join(", "));
       setMediaFiles(files);
       setScanRoots(roots);
+      setTags(savedTags);
       setScanPaths((current) => (current.length ? current : roots.map((root) => root.path)));
       setStatus(files.length ? `Loaded ${files.length.toLocaleString()} cached files` : "Ready to scan");
     } catch (error) {
@@ -188,9 +205,12 @@ function App() {
       });
       const files = await invoke<MediaFile[]>("list_media");
       const roots = await invoke<ScanRoot[]>("list_scan_roots");
+      const savedTags = await invoke<TagSummary[]>("list_tags");
       setScanResult(result);
       setMediaFiles(files);
       setScanRoots(roots);
+      setTags(savedTags);
+      setSelectedFileIds([]);
       setStatus(
         `Scan complete: ${result.scannedFiles.toLocaleString()} processed, ${result.skippedUnchanged.toLocaleString()} unchanged`
       );
@@ -199,6 +219,37 @@ function App() {
     } finally {
       setIsScanning(false);
     }
+  }
+
+  function toggleFileSelection(fileId: number) {
+    setSelectedFileIds((currentIds) =>
+      currentIds.includes(fileId) ? currentIds.filter((id) => id !== fileId) : [...currentIds, fileId]
+    );
+  }
+
+  async function applyTagsToSelection() {
+    if (!selectedFileIds.length) {
+      setStatus("Select one or more files before applying tags");
+      return;
+    }
+
+    const tagNames = tagInput
+      .split(",")
+      .map((tag) => tag.trim())
+      .filter(Boolean);
+    if (!tagNames.length) {
+      setStatus("Enter at least one tag");
+      return;
+    }
+
+    const savedTags = await invoke<TagSummary[]>("apply_tags", {
+      request: { fileIds: selectedFileIds, tags: tagNames }
+    });
+    const files = await invoke<MediaFile[]>("list_media");
+    setTags(savedTags);
+    setMediaFiles(files);
+    setTagInput("");
+    setStatus(`Applied ${tagNames.length} tag${tagNames.length === 1 ? "" : "s"} to ${selectedFileIds.length} file(s)`);
   }
 
   return (
@@ -236,10 +287,30 @@ function App() {
             <Tags size={16} />
             Tags
           </div>
-          <button className="tag-row">
-            <span>No tags yet</span>
-            <small>0</small>
+          <button
+            className={`tag-row ${selectedTagFilter === null ? "active-filter" : ""}`}
+            onClick={() => setSelectedTagFilter(null)}
+          >
+            <span>All files</span>
+            <small>{mediaFiles.length}</small>
           </button>
+          {tags.length ? (
+            tags.map((tag) => (
+              <button
+                className={`tag-row ${selectedTagFilter === tag.name ? "active-filter" : ""}`}
+                key={tag.id}
+                onClick={() => setSelectedTagFilter(tag.name)}
+              >
+                <span>{tag.name}</span>
+                <small>{tag.fileCount}</small>
+              </button>
+            ))
+          ) : (
+            <button className="tag-row" disabled>
+              <span>No tags yet</span>
+              <small>0</small>
+            </button>
+          )}
         </div>
       </aside>
 
@@ -386,13 +457,32 @@ function App() {
                   onChange={(event) => setSearchText(event.target.value)}
                 />
               </label>
+              <label className="tag-input">
+                <Tags size={16} />
+                <input
+                  placeholder="Add tag(s): family, vacation"
+                  value={tagInput}
+                  list="known-tags"
+                  onChange={(event) => setTagInput(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      void applyTagsToSelection();
+                    }
+                  }}
+                />
+              </label>
+              <datalist id="known-tags">
+                {tags.map((tag) => (
+                  <option value={tag.name} key={tag.id} />
+                ))}
+              </datalist>
+              <button onClick={applyTagsToSelection}>
+                <Tags size={16} />
+                Apply tag
+              </button>
               <button disabled title="Advanced filters are not built yet.">
                 <Filter size={16} />
                 Filters
-              </button>
-              <button disabled title="Tagging is not built yet.">
-                <Tags size={16} />
-                Apply tag
               </button>
               <button disabled title="CSV export is not built yet.">
                 <Copy size={16} />
@@ -403,8 +493,21 @@ function App() {
             <div className="media-grid">
               {visibleMediaFiles.length ? (
                 visibleMediaFiles.map((item) => (
-                  <article className={`media-card ${item.missing ? "missing" : ""}`} key={item.path}>
+                  <article
+                    className={`media-card ${item.missing ? "missing" : ""} ${
+                      selectedFileIds.includes(item.id) ? "selected" : ""
+                    }`}
+                    key={item.path}
+                    onClick={() => toggleFileSelection(item.id)}
+                  >
                     <div className="thumb">
+                      <input
+                        type="checkbox"
+                        checked={selectedFileIds.includes(item.id)}
+                        onChange={() => toggleFileSelection(item.id)}
+                        onClick={(event) => event.stopPropagation()}
+                        aria-label={`Select ${item.filename}`}
+                      />
                       <PreviewImage item={item} />
                       <span>{item.extension.toUpperCase()}</span>
                     </div>
@@ -416,6 +519,9 @@ function App() {
                       <span>{formatDimensions(item)}</span>
                       <div className="tag-list">
                         {item.missing ? <span>missing</span> : <span>{item.mediaType}</span>}
+                        {item.tags.map((tag) => (
+                          <span key={tag}>{tag}</span>
+                        ))}
                       </div>
                     </div>
                   </article>
@@ -427,6 +533,7 @@ function App() {
 
             <div className="data-grid" role="table" aria-label="Detailed media results">
               <div className="data-grid-row header" role="row">
+                <span>Select</span>
                 <span>Name</span>
                 <span>Type</span>
                 <span>Size</span>
@@ -434,7 +541,21 @@ function App() {
                 <span>Path</span>
               </div>
               {visibleMediaFiles.map((item) => (
-                <div className="data-grid-row" role="row" key={`${item.path}-row`}>
+                <div
+                  className={`data-grid-row ${selectedFileIds.includes(item.id) ? "selected" : ""}`}
+                  role="row"
+                  key={`${item.path}-row`}
+                  onClick={() => toggleFileSelection(item.id)}
+                >
+                  <span>
+                    <input
+                      type="checkbox"
+                      checked={selectedFileIds.includes(item.id)}
+                      onChange={() => toggleFileSelection(item.id)}
+                      onClick={(event) => event.stopPropagation()}
+                      aria-label={`Select ${item.filename}`}
+                    />
+                  </span>
                   <span>{item.filename}</span>
                   <span>{item.extension.toUpperCase()}</span>
                   <span>{item.fileSizeMb} MB</span>

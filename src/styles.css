@@ -139,6 +139,11 @@ button:disabled {
   padding: 0 10px;
 }
 
+.tag-row.active-filter {
+  color: #ffffff;
+  background: #5e6f57;
+}
+
 .tag-row:hover,
 .toolbar button:hover,
 .filter-row button:hover,
@@ -450,6 +455,11 @@ button:disabled {
   border-radius: 7px;
 }
 
+.filter-row label.tag-input {
+  flex: 0.7;
+  min-width: 190px;
+}
+
 .filter-row input {
   width: 100%;
   min-width: 0;
@@ -472,6 +482,11 @@ button:disabled {
   border: 1px solid #d8d3c8;
   border-radius: 8px;
   background: #fbfaf7;
+}
+
+.media-card.selected {
+  border-color: #2e625f;
+  box-shadow: 0 0 0 2px rgba(46, 98, 95, 0.18);
 }
 
 .media-card.missing {
@@ -505,6 +520,13 @@ button:disabled {
   width: 100%;
   height: 100%;
   object-fit: cover;
+}
+
+.thumb input[type="checkbox"] {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 1;
 }
 
 .media-card-body {
@@ -543,9 +565,13 @@ button:disabled {
 
 .data-grid-row {
   display: grid;
-  grid-template-columns: 1.1fr 0.45fr 0.55fr 0.7fr minmax(220px, 1.7fr);
+  grid-template-columns: 0.42fr 1.1fr 0.45fr 0.55fr 0.7fr minmax(220px, 1.7fr);
   min-height: 36px;
   border-top: 1px solid #ece8df;
+}
+
+.data-grid-row.selected {
+  background: #edf5f3;
 }
 
 .data-grid-row:first-child {

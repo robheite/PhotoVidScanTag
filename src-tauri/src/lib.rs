@@ -52,6 +52,7 @@ struct MediaFile {
     megapixels: Option<f64>,
     missing: bool,
     scanned_at_unix: i64,
+    tags: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -60,6 +61,28 @@ struct ScanRoot {
     path: String,
     enabled: bool,
     updated_at_unix: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TagSummary {
+    id: i64,
+    name: String,
+    file_count: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApplyTagsRequest {
+    file_ids: Vec<i64>,
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoveTagRequest {
+    file_ids: Vec<i64>,
+    tag: String,
 }
 
 #[tauri::command]
@@ -215,12 +238,124 @@ fn list_media(state: State<'_, AppState>) -> Result<Vec<MediaFile>, String> {
                 megapixels,
                 missing: row.get::<_, i64>(13)? == 1,
                 scanned_at_unix: row.get(14)?,
+                tags: Vec::new(),
             })
         })
         .map_err(|error| error.to_string())?;
 
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())
+    let mut files = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+
+    for file in &mut files {
+        file.tags = query_tags_for_file(&conn, file.id)?;
+    }
+
+    Ok(files)
+}
+
+#[tauri::command]
+fn list_tags(state: State<'_, AppState>) -> Result<Vec<TagSummary>, String> {
+    let db_path = state
+        .db_path
+        .lock()
+        .map_err(|_| "Database state is unavailable".to_string())?
+        .clone();
+    let conn = Connection::open(db_path).map_err(|error| error.to_string())?;
+    init_db(&conn).map_err(|error| error.to_string())?;
+
+    query_tags(&conn)
+}
+
+#[tauri::command]
+fn apply_tags(request: ApplyTagsRequest, state: State<'_, AppState>) -> Result<Vec<TagSummary>, String> {
+    let db_path = state
+        .db_path
+        .lock()
+        .map_err(|_| "Database state is unavailable".to_string())?
+        .clone();
+    let mut conn = Connection::open(db_path).map_err(|error| error.to_string())?;
+    init_db(&conn).map_err(|error| error.to_string())?;
+
+    let normalized_tags: Vec<String> = request
+        .tags
+        .into_iter()
+        .map(|tag| tag.trim().to_string())
+        .filter(|tag| !tag.is_empty())
+        .collect();
+
+    if request.file_ids.is_empty() || normalized_tags.is_empty() {
+        return query_tags(&conn);
+    }
+
+    let now = unix_now();
+    let transaction = conn.transaction().map_err(|error| error.to_string())?;
+    for tag_name in normalized_tags {
+        transaction
+            .execute(
+                "INSERT INTO tags (name, created_at_unix)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(name) DO NOTHING",
+                params![tag_name, now],
+            )
+            .map_err(|error| error.to_string())?;
+        let tag_id: i64 = transaction
+            .query_row("SELECT id FROM tags WHERE name = ?1", params![tag_name], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+
+        for file_id in &request.file_ids {
+            transaction
+                .execute(
+                    "INSERT INTO file_tags (file_id, tag_id, created_at_unix)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(file_id, tag_id) DO NOTHING",
+                    params![file_id, tag_id, now],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+
+    query_tags(&conn)
+}
+
+#[tauri::command]
+fn remove_tag_from_files(
+    request: RemoveTagRequest,
+    state: State<'_, AppState>,
+) -> Result<Vec<TagSummary>, String> {
+    let db_path = state
+        .db_path
+        .lock()
+        .map_err(|_| "Database state is unavailable".to_string())?
+        .clone();
+    let mut conn = Connection::open(db_path).map_err(|error| error.to_string())?;
+    init_db(&conn).map_err(|error| error.to_string())?;
+
+    let tag_name = request.tag.trim().to_string();
+    if request.file_ids.is_empty() || tag_name.is_empty() {
+        return query_tags(&conn);
+    }
+
+    let tag_id = conn
+        .query_row("SELECT id FROM tags WHERE name = ?1", params![tag_name], |row| row.get::<_, i64>(0))
+        .optional()
+        .map_err(|error| error.to_string())?;
+
+    if let Some(tag_id) = tag_id {
+        let transaction = conn.transaction().map_err(|error| error.to_string())?;
+        for file_id in request.file_ids {
+            transaction
+                .execute(
+                    "DELETE FROM file_tags WHERE file_id = ?1 AND tag_id = ?2",
+                    params![file_id, tag_id],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+    }
+
+    query_tags(&conn)
 }
 
 #[tauri::command]
@@ -288,12 +423,72 @@ fn init_db(conn: &Connection) -> rusqlite::Result<()> {
             scanned_at_unix INTEGER NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS tags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL COLLATE NOCASE,
+            created_at_unix INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS file_tags (
+            file_id INTEGER NOT NULL,
+            tag_id INTEGER NOT NULL,
+            created_at_unix INTEGER NOT NULL,
+            PRIMARY KEY (file_id, tag_id),
+            FOREIGN KEY (file_id) REFERENCES media_files(id) ON DELETE CASCADE,
+            FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
+        );
+
         CREATE INDEX IF NOT EXISTS idx_media_scan_root ON media_files(scan_root);
         CREATE INDEX IF NOT EXISTS idx_media_extension ON media_files(extension);
         CREATE INDEX IF NOT EXISTS idx_media_missing ON media_files(missing);
         CREATE INDEX IF NOT EXISTS idx_media_date_taken ON media_files(date_taken_unix);
+        CREATE INDEX IF NOT EXISTS idx_file_tags_tag_id ON file_tags(tag_id);
         ",
     )
+}
+
+fn query_tags(conn: &Connection) -> Result<Vec<TagSummary>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT tags.id, tags.name, COUNT(file_tags.file_id) AS file_count
+             FROM tags
+             LEFT JOIN file_tags ON file_tags.tag_id = tags.id
+             GROUP BY tags.id, tags.name
+             ORDER BY tags.name COLLATE NOCASE ASC",
+        )
+        .map_err(|error| error.to_string())?;
+
+    let rows = statement
+        .query_map([], |row| {
+            Ok(TagSummary {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                file_count: row.get(2)?,
+            })
+        })
+        .map_err(|error| error.to_string())?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+fn query_tags_for_file(conn: &Connection, file_id: i64) -> Result<Vec<String>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT tags.name
+             FROM tags
+             INNER JOIN file_tags ON file_tags.tag_id = tags.id
+             WHERE file_tags.file_id = ?1
+             ORDER BY tags.name COLLATE NOCASE ASC",
+        )
+        .map_err(|error| error.to_string())?;
+
+    let rows = statement
+        .query_map(params![file_id], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
 }
 
 fn cache_media_file(
@@ -470,7 +665,10 @@ pub fn run() {
             supported_extensions,
             scan_media,
             list_media,
-            list_scan_roots
+            list_scan_roots,
+            list_tags,
+            apply_tags,
+            remove_tag_from_files
         ])
         .run(tauri::generate_context!())
         .expect("error while running MediaTagger");

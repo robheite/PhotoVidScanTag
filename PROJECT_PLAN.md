@@ -120,6 +120,8 @@ The app should preserve which source was used so users understand why a file was
 - Modern photo-library feel.
 - System thumbnails preferred.
 - Fallback to file-type icons when system thumbnails are unavailable.
+- Generated/cached thumbnails for video files are core functionality.
+- Generated/cached thumbnails should also support unsupported image formats such as HEIC and RAW where feasible.
 - Resizable side panels with visible horizontal drag handles.
 - No fixed-width side panels that trap the user.
 - Data grids must allow columns to be shown/hidden.
@@ -174,8 +176,20 @@ Views:
 Photo grid:
 
 - Uses system thumbnails where feasible.
+- Uses generated cached thumbnails for video files.
+- Uses generated cached thumbnails for unsupported image formats where feasible.
 - Supports multiple thumbnail sizes.
 - Shows filename, tags, file status, and basic metadata.
+
+Thumbnail layer:
+
+- Store generated thumbnails in the app data folder, not beside user media.
+- Store thumbnail status in SQLite: pending, ready, failed, unsupported.
+- Reuse cached thumbnails when source file size and modified timestamp have not changed.
+- Generate thumbnails in the background after scan.
+- Use FFmpeg/ffprobe or an equivalent proven engine for video thumbnails and video metadata.
+- Use image conversion or OS-native support for HEIC/RAW thumbnails where possible.
+- Show fallback icons only while thumbnails are pending, failed, or unsupported.
 
 Data grid:
 
@@ -324,7 +338,16 @@ Later PDF reports:
 - Add tag browser view.
 - Add CSV export for tag reports.
 
-### Milestone 4: Exact Duplicates
+### Milestone 4: Thumbnail Extraction
+
+- Add thumbnail database fields/tables.
+- Generate cached thumbnails for videos.
+- Generate cached thumbnails for HEIC/RAW where feasible.
+- Add thumbnail queue/status handling.
+- Add video metadata extraction using FFmpeg/ffprobe or equivalent.
+- Display generated thumbnails in the library grid.
+
+### Milestone 5: Exact Duplicates
 
 - Add file hashing.
 - Store hashes.
@@ -332,7 +355,7 @@ Later PDF reports:
 - Build duplicate review UI.
 - Export duplicate CSV report.
 
-### Milestone 5: Move/Copy Planner
+### Milestone 6: Move/Copy Planner
 
 - Add destination picker.
 - Add organization rule builder.
@@ -341,7 +364,7 @@ Later PDF reports:
 - Add execution with operation log.
 - Export move/copy report.
 
-### Milestone 6: Polish and Packaging
+### Milestone 7: Polish and Packaging
 
 - Improve macOS styling and behavior.
 - Improve Windows styling and behavior.
