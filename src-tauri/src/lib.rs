@@ -1,6 +1,7 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
@@ -8,6 +9,7 @@ use std::{
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tauri::{Manager, State};
 use walkdir::WalkDir;
 
@@ -20,6 +22,7 @@ struct AppState {
 struct ScanRequest {
     paths: Vec<String>,
     extensions: Vec<String>,
+    force_rescan: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -32,7 +35,7 @@ struct ScanResponse {
     errors: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct MediaFile {
     id: i64,
@@ -78,6 +81,27 @@ struct TagSummary {
     id: i64,
     name: String,
     file_count: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DuplicateGroup {
+    key: String,
+    hash: String,
+    file_count: usize,
+    wasted_size_bytes: i64,
+    wasted_size_mb: f64,
+    items: Vec<MediaFile>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DuplicateScanResponse {
+    groups: Vec<DuplicateGroup>,
+    duplicate_files: usize,
+    wasted_size_bytes: i64,
+    wasted_size_mb: f64,
+    hashed_files: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -167,8 +191,11 @@ fn scan_media(request: ScanRequest, state: State<'_, AppState>) -> Result<ScanRe
             };
 
             if entry.file_type().is_dir() {
-                if let Err(error) = cache_scan_folder(&conn, entry.path(), &root_string, scan_run_id) {
-                    response.errors.push(format!("{}: {error}", entry.path().display()));
+                if let Err(error) = cache_scan_folder(&conn, entry.path(), &root_string, scan_run_id)
+                {
+                    response
+                        .errors
+                        .push(format!("{}: {error}", entry.path().display()));
                 }
                 continue;
             }
@@ -188,7 +215,14 @@ fn scan_media(request: ScanRequest, state: State<'_, AppState>) -> Result<ScanRe
                 continue;
             }
 
-            match cache_media_file(&conn, path, &root_string, scan_run_id, started_at) {
+            match cache_media_file(
+                &conn,
+                path,
+                &root_string,
+                scan_run_id,
+                started_at,
+                request.force_rescan,
+            ) {
                 Ok(true) => response.scanned_files += 1,
                 Ok(false) => response.skipped_unchanged += 1,
                 Err(error) => response.errors.push(format!("{}: {error}", path.display())),
@@ -238,35 +272,7 @@ fn list_media(state: State<'_, AppState>) -> Result<Vec<MediaFile>, String> {
         .map_err(|error| error.to_string())?;
 
     let rows = statement
-        .query_map([], |row| {
-            let file_size_bytes: i64 = row.get(6)?;
-            let width: Option<i64> = row.get(11)?;
-            let height: Option<i64> = row.get(12)?;
-            let megapixels = width
-                .zip(height)
-                .map(|(width, height)| ((width * height) as f64 / 1_000_000.0 * 10.0).round() / 10.0);
-
-            Ok(MediaFile {
-                id: row.get(0)?,
-                path: row.get(1)?,
-                scan_root: row.get(2)?,
-                filename: row.get(3)?,
-                extension: row.get(4)?,
-                media_type: row.get(5)?,
-                file_size_bytes,
-                file_size_mb: (file_size_bytes as f64 / 1_048_576.0 * 10.0).round() / 10.0,
-                created_unix: row.get(7)?,
-                modified_unix: row.get(8)?,
-                date_taken_unix: row.get(9)?,
-                date_source: row.get(10)?,
-                width,
-                height,
-                megapixels,
-                missing: row.get::<_, i64>(13)? == 1,
-                scanned_at_unix: row.get(14)?,
-                tags: Vec::new(),
-            })
-        })
+        .query_map([], |row| map_media_row(row))
         .map_err(|error| error.to_string())?;
 
     let mut files = rows
@@ -294,7 +300,10 @@ fn list_tags(state: State<'_, AppState>) -> Result<Vec<TagSummary>, String> {
 }
 
 #[tauri::command]
-fn apply_tags(request: ApplyTagsRequest, state: State<'_, AppState>) -> Result<Vec<TagSummary>, String> {
+fn apply_tags(
+    request: ApplyTagsRequest,
+    state: State<'_, AppState>,
+) -> Result<Vec<TagSummary>, String> {
     let db_path = state
         .db_path
         .lock()
@@ -326,7 +335,11 @@ fn apply_tags(request: ApplyTagsRequest, state: State<'_, AppState>) -> Result<V
             )
             .map_err(|error| error.to_string())?;
         let tag_id: i64 = transaction
-            .query_row("SELECT id FROM tags WHERE name = ?1", params![tag_name], |row| row.get(0))
+            .query_row(
+                "SELECT id FROM tags WHERE name = ?1",
+                params![tag_name],
+                |row| row.get(0),
+            )
             .map_err(|error| error.to_string())?;
 
         for file_id in &request.file_ids {
@@ -364,7 +377,11 @@ fn remove_tag_from_files(
     }
 
     let tag_id = conn
-        .query_row("SELECT id FROM tags WHERE name = ?1", params![tag_name], |row| row.get::<_, i64>(0))
+        .query_row(
+            "SELECT id FROM tags WHERE name = ?1",
+            params![tag_name],
+            |row| row.get::<_, i64>(0),
+        )
         .optional()
         .map_err(|error| error.to_string())?;
 
@@ -382,6 +399,199 @@ fn remove_tag_from_files(
     }
 
     query_tags(&conn)
+}
+
+#[tauri::command]
+fn open_file_location(path: String) -> Result<(), String> {
+    let target = PathBuf::from(path.trim());
+    if !target.exists() {
+        return Err("File does not exist".to_string());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .args(["/select,", &target.to_string_lossy()])
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(&target)
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        let parent = target
+            .parent()
+            .ok_or_else(|| "Unable to resolve parent folder".to_string())?;
+        std::process::Command::new("xdg-open")
+            .arg(parent)
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+}
+
+#[tauri::command]
+fn open_file_path(path: String) -> Result<(), String> {
+    let file_path = PathBuf::from(&path);
+    if !file_path.exists() {
+        return Err(format!("File does not exist: {path}"));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", &path])
+            .spawn()
+            .map_err(|error| error.to_string())?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&path)
+            .spawn()
+            .map_err(|error| error.to_string())?;
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&path)
+            .spawn()
+            .map_err(|error| error.to_string())?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn save_text_report(path: String, contents: String) -> Result<(), String> {
+    let report_path = PathBuf::from(&path);
+    if let Some(parent) = report_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+
+    fs::write(report_path, contents).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn find_duplicates(state: State<'_, AppState>) -> Result<DuplicateScanResponse, String> {
+    let db_path = state
+        .db_path
+        .lock()
+        .map_err(|_| "Database state is unavailable".to_string())?
+        .clone();
+    let conn = Connection::open(db_path).map_err(|error| error.to_string())?;
+    init_db(&conn).map_err(|error| error.to_string())?;
+
+    let mut statement = conn
+        .prepare(
+            "SELECT id, path, file_size_bytes, COALESCE(file_hash, '')
+             FROM media_files
+             WHERE missing = 0
+               AND file_size_bytes IN (
+                 SELECT file_size_bytes
+                 FROM media_files
+                 WHERE missing = 0
+                 GROUP BY file_size_bytes
+                 HAVING COUNT(*) > 1
+               )
+             ORDER BY file_size_bytes DESC, path ASC",
+        )
+        .map_err(|error| error.to_string())?;
+
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+
+    let candidates = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+
+    let mut grouped_file_ids: HashMap<(i64, String), Vec<i64>> = HashMap::new();
+    let mut hashed_files = 0usize;
+
+    for (file_id, path, file_size_bytes, stored_hash) in candidates {
+        let hash = if stored_hash.is_empty() {
+            let computed = compute_file_hash(Path::new(&path))
+                .map_err(|error| format!("{path}: {error}"))?;
+            conn.execute(
+                "UPDATE media_files
+                 SET file_hash = ?1, hash_updated_at_unix = ?2
+                 WHERE id = ?3",
+                params![computed, unix_now(), file_id],
+            )
+            .map_err(|error| error.to_string())?;
+            hashed_files += 1;
+            computed
+        } else {
+            stored_hash
+        };
+
+        grouped_file_ids
+            .entry((file_size_bytes, hash))
+            .or_default()
+            .push(file_id);
+    }
+
+    let mut groups = Vec::new();
+    for ((file_size_bytes, hash), file_ids) in grouped_file_ids {
+        if file_ids.len() < 2 {
+            continue;
+        }
+
+        let mut items = Vec::with_capacity(file_ids.len());
+        for file_id in file_ids {
+            items.push(query_media_file(&conn, file_id)?);
+        }
+
+        items.sort_by(|left, right| left.path.cmp(&right.path));
+        let wasted_size_bytes = file_size_bytes * (items.len() as i64 - 1);
+        groups.push(DuplicateGroup {
+            key: format!("{hash}:{file_size_bytes}"),
+            hash,
+            file_count: items.len(),
+            wasted_size_bytes,
+            wasted_size_mb: round_mb(wasted_size_bytes),
+            items,
+        });
+    }
+
+    groups.sort_by(|left, right| {
+        right
+            .wasted_size_bytes
+            .cmp(&left.wasted_size_bytes)
+            .then_with(|| right.file_count.cmp(&left.file_count))
+            .then_with(|| left.key.cmp(&right.key))
+    });
+
+    let duplicate_files = groups.iter().map(|group| group.file_count).sum();
+    let wasted_size_bytes = groups.iter().map(|group| group.wasted_size_bytes).sum();
+
+    Ok(DuplicateScanResponse {
+        groups,
+        duplicate_files,
+        wasted_size_bytes,
+        wasted_size_mb: round_mb(wasted_size_bytes),
+        hashed_files,
+    })
 }
 
 #[tauri::command]
@@ -512,7 +722,11 @@ fn init_db(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_file_tags_tag_id ON file_tags(tag_id);
         CREATE INDEX IF NOT EXISTS idx_scan_folders_root ON scan_folders(scan_root);
         ",
-    )
+    )?;
+
+    ensure_column(conn, "media_files", "file_hash", "TEXT")?;
+    ensure_column(conn, "media_files", "hash_updated_at_unix", "INTEGER")?;
+    Ok(())
 }
 
 fn cache_scan_folder(
@@ -578,12 +792,31 @@ fn query_tags_for_file(conn: &Connection, file_id: i64) -> Result<Vec<String>, S
         .map_err(|error| error.to_string())
 }
 
+fn query_media_file(conn: &Connection, file_id: i64) -> Result<MediaFile, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT id, path, scan_root, filename, extension, media_type, file_size_bytes,
+                    created_unix, modified_unix, date_taken_unix, date_source,
+                    width, height, missing, scanned_at_unix
+             FROM media_files
+             WHERE id = ?1",
+        )
+        .map_err(|error| error.to_string())?;
+
+    let mut file = statement
+        .query_row(params![file_id], |row| map_media_row(row))
+        .map_err(|error| error.to_string())?;
+    file.tags = query_tags_for_file(conn, file.id)?;
+    Ok(file)
+}
+
 fn cache_media_file(
     conn: &Connection,
     path: &Path,
     scan_root: &str,
     scan_run_id: i64,
     scanned_at: i64,
+    force_rescan: bool,
 ) -> rusqlite::Result<bool> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
@@ -601,7 +834,7 @@ fn cache_media_file(
         )
         .optional()?;
 
-    if existing == Some((file_size_bytes, modified_unix)) {
+    if !force_rescan && existing == Some((file_size_bytes, modified_unix)) {
         conn.execute(
             "UPDATE media_files
              SET missing = 0, last_seen_scan_id = ?1, scanned_at_unix = ?2
@@ -635,9 +868,9 @@ fn cache_media_file(
         "INSERT INTO media_files (
             path, scan_root, filename, extension, media_type, file_size_bytes,
             created_unix, modified_unix, date_taken_unix, date_source,
-            width, height, missing, last_seen_scan_id, scanned_at_unix
+            width, height, missing, last_seen_scan_id, scanned_at_unix, file_hash, hash_updated_at_unix
          )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0, ?13, ?14)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0, ?13, ?14, NULL, NULL)
          ON CONFLICT(path) DO UPDATE SET
             scan_root = excluded.scan_root,
             filename = excluded.filename,
@@ -650,6 +883,8 @@ fn cache_media_file(
             date_source = excluded.date_source,
             width = excluded.width,
             height = excluded.height,
+            file_hash = NULL,
+            hash_updated_at_unix = NULL,
             missing = 0,
             last_seen_scan_id = excluded.last_seen_scan_id,
             scanned_at_unix = excluded.scanned_at_unix",
@@ -693,6 +928,22 @@ fn normalize_extensions(extensions: &[String]) -> HashSet<String> {
         .collect()
 }
 
+fn compute_file_hash(path: &Path) -> Result<String, String> {
+    let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 8192];
+
+    loop {
+        let bytes_read = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 fn media_type(extension: &str) -> &'static str {
     match extension {
         "jpg" | "jpeg" | "png" | "gif" | "bmp" | "tif" | "tiff" | "webp" | "heic" | "heif" => {
@@ -705,9 +956,41 @@ fn media_type(extension: &str) -> &'static str {
     }
 }
 
+fn map_media_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaFile> {
+    let file_size_bytes: i64 = row.get(6)?;
+    let width: Option<i64> = row.get(11)?;
+    let height: Option<i64> = row.get(12)?;
+    let megapixels = width
+        .zip(height)
+        .map(|(width, height)| ((width * height) as f64 / 1_000_000.0 * 10.0).round() / 10.0);
+
+    Ok(MediaFile {
+        id: row.get(0)?,
+        path: row.get(1)?,
+        scan_root: row.get(2)?,
+        filename: row.get(3)?,
+        extension: row.get(4)?,
+        media_type: row.get(5)?,
+        file_size_bytes,
+        file_size_mb: round_mb(file_size_bytes),
+        created_unix: row.get(7)?,
+        modified_unix: row.get(8)?,
+        date_taken_unix: row.get(9)?,
+        date_source: row.get(10)?,
+        width,
+        height,
+        megapixels,
+        missing: row.get::<_, i64>(13)? == 1,
+        scanned_at_unix: row.get(14)?,
+        tags: Vec::new(),
+    })
+}
+
 fn list_media_count(conn: &Connection) -> rusqlite::Result<usize> {
-    conn.query_row("SELECT COUNT(*) FROM media_files", [], |row| row.get::<_, i64>(0))
-        .map(|count| count as usize)
+    conn.query_row("SELECT COUNT(*) FROM media_files", [], |row| {
+        row.get::<_, i64>(0)
+    })
+    .map(|count| count as usize)
 }
 
 fn missing_media_count(conn: &Connection) -> rusqlite::Result<usize> {
@@ -717,6 +1000,30 @@ fn missing_media_count(conn: &Connection) -> rusqlite::Result<usize> {
         |row| row.get::<_, i64>(0),
     )
     .map(|count| count as usize)
+}
+
+fn ensure_column(
+    conn: &Connection,
+    table_name: &str,
+    column_name: &str,
+    column_definition: &str,
+) -> rusqlite::Result<()> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table_name})"))?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    let column_names = rows.collect::<Result<Vec<_>, _>>()?;
+
+    if !column_names.iter().any(|name| name == column_name) {
+        conn.execute(
+            &format!("ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}"),
+            [],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn round_mb(bytes: i64) -> f64 {
+    (bytes as f64 / 1_048_576.0 * 10.0).round() / 10.0
 }
 
 fn system_time_to_unix(time: SystemTime) -> Option<i64> {
@@ -729,35 +1036,69 @@ fn unix_now() -> i64 {
     system_time_to_unix(SystemTime::now()).unwrap_or_default()
 }
 
+fn startup_log_path() -> PathBuf {
+    let base = dirs::data_local_dir()
+        .or_else(dirs::cache_dir)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("MediaTagger").join("startup.log")
+}
+
+fn write_startup_log(message: &str) {
+    let path = startup_log_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "[{}] {message}", unix_now());
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    std::panic::set_hook(Box::new(|panic_info| {
+        write_startup_log(&format!("panic: {panic_info}"));
+    }));
+    write_startup_log("run() entered");
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            write_startup_log("setup() started");
             let app_data_dir = app
                 .path()
                 .app_data_dir()
                 .map_err(|error| Box::<dyn std::error::Error>::from(error))?;
+            write_startup_log(&format!("app data dir: {}", app_data_dir.display()));
             fs::create_dir_all(&app_data_dir)?;
             let db_path = app_data_dir.join("mediatagger.sqlite3");
+            write_startup_log(&format!("db path: {}", db_path.display()));
             let conn = Connection::open(&db_path)?;
             init_db(&conn)?;
             app.manage(AppState {
                 db_path: Mutex::new(db_path),
             });
+            write_startup_log("setup() completed");
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             health_check,
             supported_extensions,
             scan_media,
+            open_file_path,
+            open_file_location,
+            save_text_report,
             list_media,
             list_scan_roots,
             list_scan_folders,
             list_tags,
             apply_tags,
-            remove_tag_from_files
+            remove_tag_from_files,
+            find_duplicates
         ])
+        .on_window_event(|_window, event| {
+            write_startup_log(&format!("window event: {event:?}"));
+        })
         .run(tauri::generate_context!())
         .expect("error while running MediaTagger");
 }

@@ -31,6 +31,12 @@ Tauri desktop development, after Rust is installed:
 npm run tauri dev
 ```
 
+Windows Tauri development with automatic cleanup of stale Vite listeners on port `1420` before and after the session:
+
+```powershell
+npm run tauri:dev:windows
+```
+
 Windows desktop build:
 
 ```powershell

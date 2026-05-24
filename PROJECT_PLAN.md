@@ -383,3 +383,7 @@ The expected library size is usually thousands of files and may reach the low te
 - Should folder tags apply only to files currently scanned, or should new files discovered later inherit the folder tag automatically? Recommended: new files should inherit folder tags automatically through effective tag resolution.
 - Should folder tags be removable separately from direct file tags? Recommended: yes.
 - Should missing files keep their tags? Recommended: yes, until the user removes the file record from the database.
+
+## Known UI Follow-Ups
+
+- Library details panel: portrait-oriented images can overflow the preview well and visually bleed into the metadata area. The preview container needs stricter image containment and max-height behavior so tall images stay fully inside the details preview region.
