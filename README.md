@@ -60,3 +60,5 @@ npm run tauri:build:macos
 ```
 
 See [MAC_BUILD.md](</E:/New folder/OneDrive/Documents/Bekka File Search and Tag/MAC_BUILD.md>) for the dedicated macOS branch workflow and release checklist.
+
+For GitHub-hosted unsigned macOS test builds, use the `macOS Build` workflow on the `MAC` branch and download the `MediaTagger-macos-bundle` artifact from the workflow run.
