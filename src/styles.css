@@ -1542,10 +1542,39 @@ button:disabled {
 }
 
 .data-grid-row span {
+  display: flex;
+  align-items: center;
+  min-width: 0;
   overflow: hidden;
   padding: 9px 10px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.grid-header-cell {
+  position: relative;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.column-resize-handle {
+  flex: 0 0 auto;
+  width: 10px;
+  min-width: 10px;
+  height: 100%;
+  margin-right: -10px;
+  border: 0;
+  cursor: col-resize;
+  background: transparent;
+}
+
+.column-resize-handle::after {
+  content: "";
+  display: block;
+  width: 1px;
+  height: 18px;
+  margin: 8px auto;
+  background: #c6c0b3;
 }
 
 .empty-state {

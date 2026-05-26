@@ -415,8 +415,7 @@ fn list_media(state: State<'_, AppState>) -> Result<Vec<MediaFile>, String> {
                     created_unix, modified_unix, date_taken_unix, date_source,
                     width, height, missing, scanned_at_unix
              FROM media_files
-             ORDER BY missing ASC, date_taken_unix DESC, filename ASC
-             LIMIT 500",
+             ORDER BY missing ASC, date_taken_unix DESC, filename ASC",
         )
         .map_err(|error| error.to_string())?;
 
@@ -428,8 +427,10 @@ fn list_media(state: State<'_, AppState>) -> Result<Vec<MediaFile>, String> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
 
+    let tags_by_file = query_tags_by_file(&conn)?;
+
     for file in &mut files {
-        file.tags = query_tags_for_file(&conn, file.id)?;
+        file.tags = tags_by_file.get(&file.id).cloned().unwrap_or_default();
     }
 
     Ok(files)
@@ -1723,6 +1724,29 @@ fn query_tags_for_file(conn: &Connection, file_id: i64) -> Result<Vec<String>, S
 
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())
+}
+
+fn query_tags_by_file(conn: &Connection) -> Result<HashMap<i64, Vec<String>>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT file_tags.file_id, tags.name
+             FROM file_tags
+             INNER JOIN tags ON tags.id = file_tags.tag_id
+             ORDER BY file_tags.file_id ASC, tags.name COLLATE NOCASE ASC",
+        )
+        .map_err(|error| error.to_string())?;
+
+    let rows = statement
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+        .map_err(|error| error.to_string())?;
+
+    let mut tag_map = HashMap::<i64, Vec<String>>::new();
+    for row in rows {
+        let (file_id, tag_name) = row.map_err(|error| error.to_string())?;
+        tag_map.entry(file_id).or_default().push(tag_name);
+    }
+
+    Ok(tag_map)
 }
 
 fn query_media_file(conn: &Connection, file_id: i64) -> Result<MediaFile, String> {
