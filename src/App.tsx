@@ -241,6 +241,7 @@ type FilterPreset = {
   dateSourceFilter: DateSourceFilter;
   selectedTagFilter: string | null;
 };
+type GridColumnSet = "media" | "duplicate" | "move";
 
 type OperationHistoryEntry = {
   id: number;
@@ -388,6 +389,12 @@ function App() {
     Settings: 520
   });
   const splitResizeRef = useRef<{ section: SplitSection; startX: number; startWidth: number } | null>(null);
+  const [gridColumnWidths, setGridColumnWidths] = useState<Record<GridColumnSet, number[]>>({
+    media: [52, 240, 90, 96, 128, 420],
+    duplicate: [52, 220, 90, 96, 128, 360, 220],
+    move: [220, 240, 360, 420]
+  });
+  const gridResizeRef = useRef<{ set: GridColumnSet; index: number; startX: number; startWidth: number } | null>(null);
 
   useEffect(() => {
     void initializeAppData();
@@ -432,6 +439,18 @@ function App() {
 
   useEffect(() => {
     const handleMouseMove = (event: MouseEvent) => {
+      if (gridResizeRef.current) {
+        const delta = event.clientX - gridResizeRef.current.startX;
+        const nextWidth = Math.max(60, gridResizeRef.current.startWidth + delta);
+        setGridColumnWidths((current) => ({
+          ...current,
+          [gridResizeRef.current!.set]: current[gridResizeRef.current!.set].map((width, index) =>
+            index === gridResizeRef.current!.index ? nextWidth : width
+          )
+        }));
+        return;
+      }
+
       if (!detailResizeRef.current) {
         if (splitResizeRef.current) {
           const delta = event.clientX - splitResizeRef.current.startX;
@@ -450,6 +469,7 @@ function App() {
     };
 
     const handleMouseUp = () => {
+      gridResizeRef.current = null;
       detailResizeRef.current = null;
       splitResizeRef.current = null;
       document.body.style.cursor = "";
@@ -790,6 +810,17 @@ function App() {
       section,
       startX: clientX,
       startWidth: panelSplitWidths[section]
+    };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  }
+
+  function beginGridColumnResize(set: GridColumnSet, index: number, clientX: number) {
+    gridResizeRef.current = {
+      set,
+      index,
+      startX: clientX,
+      startWidth: gridColumnWidths[set][index]
     };
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
@@ -2649,15 +2680,15 @@ function App() {
                 ) : null}
 
                 <div className="move-preview-table data-grid" role="table" aria-label="Move copy preview">
-                  <div className="data-grid-row header move-preview-row" role="row">
-                    <span>Name</span>
-                    <span>Action</span>
-                    <span>Source</span>
-                    <span>Destination</span>
-                  </div>
+                  {renderGridHeader(["Name", "Action", "Source", "Destination"], "move", gridColumnWidths.move, beginGridColumnResize, "move-preview-row")}
                   {movePreviewItems.length ? (
                     movePreviewItems.map((item) => (
-                      <div className="data-grid-row move-preview-row" role="row" key={`${item.id}-${item.destinationPath}`}>
+                      <div
+                        className="data-grid-row move-preview-row"
+                        role="row"
+                        key={`${item.id}-${item.destinationPath}`}
+                        style={{ gridTemplateColumns: buildGridTemplate(gridColumnWidths.move) }}
+                      >
                         <span>{item.filename}</span>
                         <span>{item.reason}</span>
                         <span>{item.sourcePath}</span>
@@ -2949,21 +2980,20 @@ function App() {
                     </div>
 
                     <div className="data-grid duplicate-review-table" role="table" aria-label="Duplicate review results">
-                      <div className="data-grid-row header duplicate-grid-row" role="row">
-                        <span>Select</span>
-                        <span>Name</span>
-                        <span>Type</span>
-                        <span>Size</span>
-                        <span>Date taken</span>
-                        <span>Path</span>
-                        <span>Tags</span>
-                      </div>
+                      {renderGridHeader(
+                        ["Select", "Name", "Type", "Size", "Date taken", "Path", "Tags"],
+                        "duplicate",
+                        gridColumnWidths.duplicate,
+                        beginGridColumnResize,
+                        "duplicate-grid-row"
+                      )}
                       {duplicateItems.map((item) => (
                         <div
                           className={`data-grid-row duplicate-grid-row ${selectedFileIds.includes(item.id) ? "selected" : ""}`}
                           role="row"
                           key={`${item.path}-duplicate-row`}
                           onClick={() => activateMediaFile(item.id)}
+                          style={{ gridTemplateColumns: buildGridTemplate(gridColumnWidths.duplicate) }}
                         >
                           <span>
                             <input
@@ -3621,20 +3651,14 @@ function App() {
                 ) : null}
 
                 <div className="data-grid" role="table" aria-label="Detailed media results">
-              <div className="data-grid-row header" role="row">
-                <span>Select</span>
-                <span>Name</span>
-                <span>Type</span>
-                <span>Size</span>
-                <span>Date taken</span>
-                <span>Path</span>
-              </div>
+              {renderGridHeader(["Select", "Name", "Type", "Size", "Date taken", "Path"], "media", gridColumnWidths.media, beginGridColumnResize)}
               {gridMediaFiles.map((item) => (
                 <div
                   className={`data-grid-row ${selectedFileIds.includes(item.id) ? "selected" : ""}`}
                   role="row"
                   key={`${item.path}-row`}
                   onClick={() => activateMediaFile(item.id)}
+                  style={{ gridTemplateColumns: buildGridTemplate(gridColumnWidths.media) }}
                 >
                   <span>
                     <input
@@ -3939,6 +3963,43 @@ function joinPathParts(base: string, ...parts: string[]) {
 
 function csvEscape(value: string) {
   return `"${value.replace(/"/g, "\"\"")}"`;
+}
+
+function buildGridTemplate(widths: number[]) {
+  return widths.map((width) => `minmax(0, ${width}px)`).join(" ");
+}
+
+function renderGridHeader(
+  labels: string[],
+  set: GridColumnSet,
+  widths: number[],
+  beginResize: (set: GridColumnSet, index: number, clientX: number) => void,
+  className?: string
+) {
+  return (
+    <div
+      className={`data-grid-row header ${className ?? ""}`.trim()}
+      role="row"
+      style={{ gridTemplateColumns: buildGridTemplate(widths) }}
+    >
+      {labels.map((label, index) => (
+        <span className="grid-header-cell" key={`${set}-${label}-${index}`}>
+          <span>{label}</span>
+          {index < labels.length - 1 ? (
+            <button
+              className="column-resize-handle"
+              aria-label={`Resize ${label} column`}
+              onMouseDown={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                beginResize(set, index, event.clientX);
+              }}
+            />
+          ) : null}
+        </span>
+      ))}
+    </div>
+  );
 }
 
 function formatDimensions(item: MediaFile) {
