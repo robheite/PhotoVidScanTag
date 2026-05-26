@@ -1301,6 +1301,20 @@ button:disabled {
   overscroll-behavior: contain;
 }
 
+.virtualized-media-grid {
+  position: relative;
+  display: block;
+}
+
+.virtual-media-grid-body {
+  position: relative;
+  min-height: 100%;
+}
+
+.virtual-media-grid-item {
+  position: absolute;
+}
+
 .library-grid {
   flex: 1 1 0;
 }
