@@ -397,6 +397,94 @@ function VirtualDataGrid<T>({
   );
 }
 
+function VirtualMediaGrid<T>({
+  items,
+  width,
+  height,
+  className,
+  emptyMessage,
+  getItemKey,
+  renderItem
+}: {
+  items: T[];
+  width: number;
+  height: number;
+  className?: string;
+  emptyMessage: string;
+  getItemKey: (item: T, index: number) => string;
+  renderItem: (item: T, index: number) => ReactNode;
+}) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportHeight, setViewportHeight] = useState(320);
+  const [viewportWidth, setViewportWidth] = useState(width);
+
+  useEffect(() => {
+    const element = containerRef.current;
+    if (!element) {
+      return;
+    }
+
+    const updateSize = () => {
+      setViewportHeight(element.clientHeight);
+      setViewportWidth(element.clientWidth);
+    };
+    updateSize();
+
+    const observer = new ResizeObserver(updateSize);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  const gap = 12;
+  const columnWidth = width + gap;
+  const rowHeight = height + gap;
+  const columns = Math.max(1, Math.floor((viewportWidth + gap) / columnWidth));
+  const totalRows = Math.ceil(items.length / columns);
+  const overscanRows = 2;
+  const visibleStartRow = Math.max(0, Math.floor(scrollTop / rowHeight) - overscanRows);
+  const visibleEndRow = Math.min(totalRows, Math.ceil((scrollTop + viewportHeight) / rowHeight) + overscanRows);
+  const startIndex = visibleStartRow * columns;
+  const endIndex = Math.min(items.length, visibleEndRow * columns);
+  const visibleItems = items.slice(startIndex, endIndex);
+  const bodyHeight = totalRows > 0 ? totalRows * rowHeight - gap : 0;
+
+  return (
+    <div
+      className={`media-grid virtualized-media-grid ${className ?? ""}`.trim()}
+      ref={containerRef}
+      onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
+    >
+      {items.length ? (
+        <div className="virtual-media-grid-body" style={{ height: bodyHeight }}>
+          {visibleItems.map((item, index) => {
+            const itemIndex = startIndex + index;
+            const row = Math.floor(itemIndex / columns);
+            const column = itemIndex % columns;
+
+            return (
+              <div
+                className="virtual-media-grid-item"
+                key={getItemKey(item, itemIndex)}
+                style={{
+                  width,
+                  height,
+                  left: column * columnWidth,
+                  top: row * rowHeight
+                }}
+              >
+                {renderItem(item, itemIndex)}
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <div className="empty-state wide">{emptyMessage}</div>
+      )}
+    </div>
+  );
+}
+
 function App() {
   const [scanPaths, setScanPaths] = useState<string[]>([]);
   const [availableExtensions, setAvailableExtensions] = useState<string[]>([]);
@@ -492,6 +580,7 @@ function App() {
     () => [...new Set(mediaFiles.map((file) => file.extension.toLowerCase()))].sort(),
     [mediaFiles]
   );
+  const selectedFileIdSet = useMemo(() => new Set(selectedFileIds), [selectedFileIds]);
   const deferredSearchText = useDeferredValue(searchText);
   const deferredTagFilterInput = useDeferredValue(tagFilterInput);
   const deferredDateFromInput = useDeferredValue(dateFromInput);
@@ -741,8 +830,8 @@ function App() {
   const activeMediaCollection = activeSection === "Duplicates" ? duplicateItems : visibleMediaFiles;
   const duplicateItemIds = useMemo(() => duplicateItems.map((item) => item.id), [duplicateItems]);
   const selectedDuplicateItems = useMemo(
-    () => duplicateItems.filter((item) => selectedFileIds.includes(item.id)),
-    [duplicateItems, selectedFileIds]
+    () => duplicateItems.filter((item) => selectedFileIdSet.has(item.id)),
+    [duplicateItems, selectedFileIdSet]
   );
   const selectedDuplicateCount = useMemo(
     () => selectedDuplicateItems.length,
@@ -764,14 +853,14 @@ function App() {
   const activeMediaItem = useMemo(
     () =>
       activeMediaCollection.find((item) => item.id === activeMediaId) ??
-      activeMediaCollection.find((item) => selectedFileIds.includes(item.id)) ??
+      activeMediaCollection.find((item) => selectedFileIdSet.has(item.id)) ??
       activeMediaCollection[0] ??
       null,
-    [activeMediaCollection, activeMediaId, selectedFileIds]
+    [activeMediaCollection, activeMediaId, selectedFileIdSet]
   );
   const activeDuplicateIsSelected = useMemo(
-    () => Boolean(activeMediaItem && duplicateItemIds.includes(activeMediaItem.id) && selectedFileIds.includes(activeMediaItem.id)),
-    [activeMediaItem, duplicateItemIds, selectedFileIds]
+    () => Boolean(activeMediaItem && duplicateItemIds.includes(activeMediaItem.id) && selectedFileIdSet.has(activeMediaItem.id)),
+    [activeMediaItem, duplicateItemIds, selectedFileIdSet]
   );
 
   const configuredRootCount = Math.max(scanPaths.length, scanRoots.length);
@@ -781,8 +870,8 @@ function App() {
     duplicateScanResult?.wastedSizeMb ?? duplicateGroups.reduce((sum, group) => sum + group.wastedSizeMb, 0);
   const isBusy = isScanning || isFindingDuplicates || isExecutingMoveCopy;
   const selectedFiles = useMemo(
-    () => mediaFiles.filter((item) => selectedFileIds.includes(item.id)),
-    [mediaFiles, selectedFileIds]
+    () => mediaFiles.filter((item) => selectedFileIdSet.has(item.id)),
+    [mediaFiles, selectedFileIdSet]
   );
   const moveSelectedFolderSet = useMemo(() => new Set(moveSelectedFolderPaths), [moveSelectedFolderPaths]);
   const moveSourceFiles = useMemo(() => {
@@ -802,6 +891,38 @@ function App() {
   const moveSourcePreviewFiles = useMemo(
     () => moveEligibleFiles.slice(0, scanPreviewLimit),
     [moveEligibleFiles]
+  );
+  const renderSelectableMediaCard = (item: MediaFile) => (
+    <article
+      className={`media-card ${item.missing ? "missing" : ""} ${
+        selectedFileIdSet.has(item.id) ? "selected" : ""
+      } ${activeMediaItem?.id === item.id ? "active-item" : ""}`}
+      onClick={() => activateMediaFile(item.id)}
+      title={`${item.filename} | ${item.path}`}
+      style={{
+        width: `${activeThumbnailDimensions.width}px`,
+        height: `${activeThumbnailDimensions.height}px`
+      }}
+    >
+      <div
+        className="thumb"
+        style={{
+          width: `${activeThumbnailDimensions.width}px`,
+          height: `${activeThumbnailDimensions.height}px`,
+          minHeight: `${activeThumbnailDimensions.height}px`
+        }}
+      >
+        <input
+          type="checkbox"
+          checked={selectedFileIdSet.has(item.id)}
+          onChange={() => toggleFileSelection(item.id)}
+          onClick={(event) => event.stopPropagation()}
+          aria-label={`Select ${item.filename}`}
+        />
+        <PreviewImage item={item} />
+        <span>{item.extension.toUpperCase()}</span>
+      </div>
+    </article>
   );
 
   useEffect(() => {
@@ -1857,7 +1978,7 @@ function App() {
 
   function sendDuplicateSelectionToMoveCopy() {
     const duplicateSelectionIds = duplicateItems
-      .filter((item) => selectedFileIds.includes(item.id))
+      .filter((item) => selectedFileIdSet.has(item.id))
       .map((item) => item.id);
 
     if (!duplicateSelectionIds.length) {
@@ -1872,7 +1993,7 @@ function App() {
   }
 
   async function runDuplicateCleanup() {
-    const selectedPaths = duplicateItems.filter((item) => selectedFileIds.includes(item.id)).map((item) => item.path);
+    const selectedPaths = duplicateItems.filter((item) => selectedFileIdSet.has(item.id)).map((item) => item.path);
     if (!selectedPaths.length) {
       setStatus("Select one or more duplicate files first");
       return;
@@ -2672,45 +2793,15 @@ function App() {
                         <strong>{moveSourcePreviewFiles.length.toLocaleString()} preview files</strong>
                         <span>Showing the first {Math.min(scanPreviewLimit, moveEligibleFiles.length).toLocaleString()} eligible files from this plan source.</span>
                       </div>
-                      <div className="media-grid move-source-grid">
-                        {moveSourcePreviewFiles.length ? (
-                          moveSourcePreviewFiles.map((item) => (
-                            <article
-                              className={`media-card ${item.missing ? "missing" : ""} ${
-                                selectedFileIds.includes(item.id) ? "selected" : ""
-                              } ${activeMediaItem?.id === item.id ? "active-item" : ""}`}
-                              key={`move-preview-${item.path}`}
-                              onClick={() => activateMediaFile(item.id)}
-                              title={`${item.filename} | ${item.path}`}
-                              style={{
-                                width: `${activeThumbnailDimensions.width}px`,
-                                height: `${activeThumbnailDimensions.height}px`
-                              }}
-                            >
-                              <div
-                                className="thumb"
-                                style={{
-                                  width: `${activeThumbnailDimensions.width}px`,
-                                  height: `${activeThumbnailDimensions.height}px`,
-                                  minHeight: `${activeThumbnailDimensions.height}px`
-                                }}
-                              >
-                                <input
-                                  type="checkbox"
-                                  checked={selectedFileIds.includes(item.id)}
-                                  onChange={() => toggleFileSelection(item.id)}
-                                  onClick={(event) => event.stopPropagation()}
-                                  aria-label={`Select ${item.filename}`}
-                                />
-                                <PreviewImage item={item} />
-                                <span>{item.extension.toUpperCase()}</span>
-                              </div>
-                            </article>
-                          ))
-                        ) : (
-                          <div className="empty-state wide">No source files are currently available for preview.</div>
-                        )}
-                      </div>
+                      <VirtualMediaGrid
+                        items={moveSourcePreviewFiles}
+                        width={activeThumbnailDimensions.width}
+                        height={activeThumbnailDimensions.height}
+                        className="move-source-grid"
+                        emptyMessage="No source files are currently available for preview."
+                        getItemKey={(item) => `move-preview-${item.path}`}
+                        renderItem={(item) => renderSelectableMediaCard(item)}
+                      />
                     </>
                   ) : (
                     <div className="move-preview-collapsed">Scan preview hidden. Expand it if you want to spot-check source files.</div>
@@ -3021,47 +3112,19 @@ function App() {
                       <strong>{activeDuplicateGroup ? activeDuplicateGroup.hash.slice(0, 16) : "No group selected"}</strong>
                       {activeDuplicateGroup ? <small>{activeDuplicateGroup.hash}</small> : null}
                     </div>
-                    <div className="media-grid library-grid duplicate-review-grid">
-                      {duplicateItems.length ? (
-                        duplicateItems.map((item) => (
-                          <article
-                            className={`media-card ${item.missing ? "missing" : ""} ${
-                              selectedFileIds.includes(item.id) ? "selected" : ""
-                            } ${activeMediaItem?.id === item.id ? "active-item" : ""}`}
-                            key={`${activeDuplicateGroup?.key}-${item.path}`}
-                            onClick={() => activateMediaFile(item.id)}
-                            title={`${item.filename} | ${item.path}`}
-                            style={{
-                              width: `${activeThumbnailDimensions.width}px`,
-                              height: `${activeThumbnailDimensions.height}px`
-                            }}
-                          >
-                            <div
-                              className="thumb"
-                              style={{
-                                width: `${activeThumbnailDimensions.width}px`,
-                                height: `${activeThumbnailDimensions.height}px`,
-                                minHeight: `${activeThumbnailDimensions.height}px`
-                              }}
-                            >
-                              <input
-                                type="checkbox"
-                                checked={selectedFileIds.includes(item.id)}
-                                onChange={() => toggleFileSelection(item.id)}
-                                onClick={(event) => event.stopPropagation()}
-                                aria-label={`Select ${item.filename}`}
-                              />
-                              <PreviewImage item={item} />
-                              <span>{item.extension.toUpperCase()}</span>
-                            </div>
-                          </article>
-                        ))
-                      ) : (
-                        <div className="empty-state wide">
-                          {duplicateScanResult ? "No files are currently selected for duplicate review." : "Run Find duplicates to load exact match groups."}
-                        </div>
-                      )}
-                    </div>
+                    <VirtualMediaGrid
+                      items={duplicateItems}
+                      width={activeThumbnailDimensions.width}
+                      height={activeThumbnailDimensions.height}
+                      className="library-grid duplicate-review-grid"
+                      emptyMessage={
+                        duplicateScanResult
+                          ? "No files are currently selected for duplicate review."
+                          : "Run Find duplicates to load exact match groups."
+                      }
+                      getItemKey={(item) => `${activeDuplicateGroup?.key}-${item.path}`}
+                      renderItem={(item) => renderSelectableMediaCard(item)}
+                    />
 
                     <VirtualDataGrid
                       labels={["Select", "Name", "Type", "Size", "Date taken", "Path", "Tags"]}
@@ -3075,13 +3138,13 @@ function App() {
                           : "Run Find duplicates to load exact match groups."
                       }
                       getRowKey={(item) => `${item.path}-duplicate-row`}
-                      getRowClassName={(item) => (selectedFileIds.includes(item.id) ? "selected" : "")}
+                      getRowClassName={(item) => (selectedFileIdSet.has(item.id) ? "selected" : "")}
                       onRowClick={(item) => activateMediaFile(item.id)}
                       renderCells={(item) => [
                         <span key="select">
                           <input
                             type="checkbox"
-                            checked={selectedFileIds.includes(item.id)}
+                            checked={selectedFileIdSet.has(item.id)}
                             onChange={() => toggleFileSelection(item.id)}
                             onClick={(event) => event.stopPropagation()}
                             aria-label={`Select ${item.filename}`}
@@ -3635,49 +3698,15 @@ function App() {
               }
             >
               <div className="library-main">
-                    <div
-                      className={`media-grid thumb-size-${thumbnailSize} ${
-                        activeSection === "Library" ? "library-grid" : "scan-grid"
-                      }`}
-                    >
-                  {visibleMediaFiles.length ? (
-                    activePreviewFiles.map((item) => (
-                      <article
-                        className={`media-card ${item.missing ? "missing" : ""} ${
-                          selectedFileIds.includes(item.id) ? "selected" : ""
-                        } ${activeMediaItem?.id === item.id ? "active-item" : ""}`}
-                        key={item.path}
-                        onClick={() => activateMediaFile(item.id)}
-                        title={`${item.filename} | ${item.path}`}
-                        style={{
-                          width: `${activeThumbnailDimensions.width}px`,
-                          height: `${activeThumbnailDimensions.height}px`
-                        }}
-                      >
-                        <div
-                          className="thumb"
-                          style={{
-                            width: `${activeThumbnailDimensions.width}px`,
-                            height: `${activeThumbnailDimensions.height}px`,
-                            minHeight: `${activeThumbnailDimensions.height}px`
-                          }}
-                        >
-                          <input
-                            type="checkbox"
-                            checked={selectedFileIds.includes(item.id)}
-                            onChange={() => toggleFileSelection(item.id)}
-                            onClick={(event) => event.stopPropagation()}
-                            aria-label={`Select ${item.filename}`}
-                          />
-                          <PreviewImage item={item} />
-                          <span>{item.extension.toUpperCase()}</span>
-                        </div>
-                      </article>
-                    ))
-                  ) : (
-                    <div className="empty-state wide">No media files found yet. Add a path and start a scan.</div>
-                  )}
-                </div>
+                    <VirtualMediaGrid
+                      items={activePreviewFiles}
+                      width={activeThumbnailDimensions.width}
+                      height={activeThumbnailDimensions.height}
+                      className={`thumb-size-${thumbnailSize} ${activeSection === "Library" ? "library-grid" : "scan-grid"}`}
+                      emptyMessage="No media files found yet. Add a path and start a scan."
+                      getItemKey={(item) => item.path}
+                      renderItem={(item) => renderSelectableMediaCard(item)}
+                    />
                 {activeSection === "Scan" && visibleMediaFiles.length > previewMediaFiles.length ? (
                   <div className="preview-limit">
                     Showing first {previewMediaFiles.length} previews here. Open Library to browse all {visibleMediaFiles.length.toLocaleString()} visible files.
@@ -3740,13 +3769,13 @@ function App() {
                   items={gridMediaFiles}
                   emptyMessage="No media files found yet. Add a path and start a scan."
                   getRowKey={(item) => `${item.path}-row`}
-                  getRowClassName={(item) => (selectedFileIds.includes(item.id) ? "selected" : "")}
+                  getRowClassName={(item) => (selectedFileIdSet.has(item.id) ? "selected" : "")}
                   onRowClick={(item) => activateMediaFile(item.id)}
                   renderCells={(item) => [
                     <span key="select">
                       <input
                         type="checkbox"
-                        checked={selectedFileIds.includes(item.id)}
+                        checked={selectedFileIdSet.has(item.id)}
                         onChange={() => toggleFileSelection(item.id)}
                         onClick={(event) => event.stopPropagation()}
                         aria-label={`Select ${item.filename}`}
