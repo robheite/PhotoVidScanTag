@@ -1387,6 +1387,21 @@ button:disabled {
   border-radius: 8px;
 }
 
+.virtualized-grid {
+  position: relative;
+}
+
+.virtual-grid-body {
+  position: relative;
+  min-height: 100%;
+}
+
+.virtualized-grid .data-grid-row {
+  position: absolute;
+  left: 0;
+  right: 0;
+}
+
 .duplicate-review-table {
   flex: 1 1 44%;
   min-height: 220px;

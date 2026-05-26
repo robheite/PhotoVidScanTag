@@ -27,7 +27,7 @@ import {
   Settings,
   Tags
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 
 const sections = [
   { label: "Scan", icon: ScanSearch, enabled: true },
@@ -310,6 +310,93 @@ function TreeRow({
   );
 }
 
+function VirtualDataGrid<T>({
+  labels,
+  columnSet,
+  columnWidths,
+  items,
+  rowClassName,
+  rowHeight = 38,
+  emptyMessage,
+  getRowKey,
+  getRowClassName,
+  renderCells,
+  onRowClick,
+  onBeginResize
+}: {
+  labels: string[];
+  columnSet: GridColumnSet;
+  columnWidths: number[];
+  items: T[];
+  rowClassName?: string;
+  rowHeight?: number;
+  emptyMessage: string;
+  getRowKey: (item: T, index: number) => string;
+  getRowClassName?: (item: T, index: number) => string;
+  renderCells: (item: T, index: number) => ReactNode[];
+  onRowClick?: (item: T, index: number) => void;
+  onBeginResize: (set: GridColumnSet, index: number, clientX: number) => void;
+}) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportHeight, setViewportHeight] = useState(320);
+
+  useEffect(() => {
+    const element = containerRef.current;
+    if (!element) {
+      return;
+    }
+
+    const updateHeight = () => setViewportHeight(element.clientHeight);
+    updateHeight();
+
+    const observer = new ResizeObserver(updateHeight);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  const overscan = 8;
+  const visibleStart = Math.max(0, Math.floor((scrollTop - rowHeight) / rowHeight) - overscan);
+  const visibleEnd = Math.min(items.length, Math.ceil((scrollTop + viewportHeight) / rowHeight) + overscan);
+  const visibleItems = items.slice(visibleStart, visibleEnd);
+  const template = buildGridTemplate(columnWidths);
+
+  return (
+    <div
+      className="data-grid virtualized-grid"
+      role="table"
+      ref={containerRef}
+      onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
+    >
+      {renderGridHeader(labels, columnSet, columnWidths, onBeginResize, rowClassName)}
+      {items.length ? (
+        <div className="virtual-grid-body" style={{ height: items.length * rowHeight }}>
+          {visibleItems.map((item, index) => {
+            const itemIndex = visibleStart + index;
+            return (
+              <div
+                className={`data-grid-row ${rowClassName ?? ""} ${getRowClassName?.(item, itemIndex) ?? ""}`.trim()}
+                role="row"
+                key={getRowKey(item, itemIndex)}
+                onClick={onRowClick ? () => onRowClick(item, itemIndex) : undefined}
+                style={{
+                  gridTemplateColumns: template,
+                  top: itemIndex * rowHeight,
+                  height: rowHeight
+                }}
+              >
+                {renderCells(item, itemIndex)}
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <div className="empty-state wide">{emptyMessage}</div>
+      )}
+    </div>
+  );
+}
+
 function App() {
   const [scanPaths, setScanPaths] = useState<string[]>([]);
   const [availableExtensions, setAvailableExtensions] = useState<string[]>([]);
@@ -405,13 +492,17 @@ function App() {
     () => [...new Set(mediaFiles.map((file) => file.extension.toLowerCase()))].sort(),
     [mediaFiles]
   );
+  const deferredSearchText = useDeferredValue(searchText);
+  const deferredTagFilterInput = useDeferredValue(tagFilterInput);
+  const deferredDateFromInput = useDeferredValue(dateFromInput);
+  const deferredDateToInput = useDeferredValue(dateToInput);
   const parsedTagFilters = useMemo(
     () =>
-      tagFilterInput
+      deferredTagFilterInput
         .split(",")
         .map((value) => value.trim().toLowerCase())
         .filter(Boolean),
-    [tagFilterInput]
+    [deferredTagFilterInput]
   );
   const parsedMinFileSizeMb = useMemo(() => parseFilterNumber(minFileSizeMb), [minFileSizeMb]);
   const parsedMaxFileSizeMb = useMemo(() => parseFilterNumber(maxFileSizeMb), [maxFileSizeMb]);
@@ -485,7 +576,7 @@ function App() {
   }, []);
 
   const visibleMediaFiles = useMemo(() => {
-    const query = searchText.trim().toLowerCase();
+    const query = deferredSearchText.trim().toLowerCase();
     const folderFilteredFiles = allFolderPaths.length
       ? mediaFiles.filter((file) => selectedFolderSet.has(fileFolderPath(file.path)))
       : mediaFiles;
@@ -512,7 +603,7 @@ function App() {
       return !file.missing;
     });
     const datedFilteredFiles = missingFilteredFiles.filter((file) => {
-      if (!dateFromInput && !dateToInput) {
+      if (!deferredDateFromInput && !deferredDateToInput) {
         return true;
       }
 
@@ -522,15 +613,15 @@ function App() {
       }
 
       const filterTime = filterDate.getTime();
-      if (dateFromInput) {
-        const fromTime = new Date(`${dateFromInput}T00:00:00`).getTime();
+      if (deferredDateFromInput) {
+        const fromTime = new Date(`${deferredDateFromInput}T00:00:00`).getTime();
         if (filterTime < fromTime) {
           return false;
         }
       }
 
-      if (dateToInput) {
-        const toTime = new Date(`${dateToInput}T23:59:59`).getTime();
+      if (deferredDateToInput) {
+        const toTime = new Date(`${deferredDateToInput}T23:59:59`).getTime();
         if (filterTime > toTime) {
           return false;
         }
@@ -589,8 +680,9 @@ function App() {
     );
   }, [
     allFolderPaths.length,
-    dateFromInput,
-    dateToInput,
+    deferredDateFromInput,
+    deferredDateToInput,
+    deferredSearchText,
     dateSourceFilter,
     extensionFilter,
     mediaFiles,
@@ -601,7 +693,6 @@ function App() {
     parsedMinFileSizeMb,
     parsedMinMegapixels,
     parsedTagFilters,
-    searchText,
     selectedFolderSet,
     selectedTagFilter,
     tagMatchMode
@@ -609,7 +700,7 @@ function App() {
 
   const previewMediaFiles = useMemo(() => visibleMediaFiles.slice(0, scanPreviewLimit), [visibleMediaFiles]);
   const filteredDuplicateGroups = useMemo(() => {
-    const query = searchText.trim().toLowerCase();
+    const query = deferredSearchText.trim().toLowerCase();
     if (!query) {
       return duplicateGroups;
     }
@@ -622,7 +713,7 @@ function App() {
           .includes(query)
       )
     );
-  }, [duplicateGroups, searchText]);
+  }, [deferredSearchText, duplicateGroups]);
   const activeDuplicateGroup = useMemo(
     () =>
       filteredDuplicateGroups.find((group) => group.key === activeDuplicateGroupKey) ??
@@ -638,10 +729,7 @@ function App() {
     () => visibleMediaFiles.slice(libraryPageStart, libraryPageStart + libraryPageSize),
     [libraryPageSize, libraryPageStart, visibleMediaFiles]
   );
-  const gridMediaFiles = useMemo(
-    () => (activeSection === "Library" ? libraryMediaFiles : visibleMediaFiles.slice(0, 250)),
-    [activeSection, libraryMediaFiles, visibleMediaFiles]
-  );
+  const gridMediaFiles = useMemo(() => (activeSection === "Library" ? libraryMediaFiles : visibleMediaFiles), [activeSection, libraryMediaFiles, visibleMediaFiles]);
   const activePreviewFiles = activeSection === "Library" ? libraryMediaFiles : previewMediaFiles;
   const activePreviewLabel = activeSection === "Library" ? "Library" : "Scan preview";
   const paginationItems = useMemo(
@@ -2679,26 +2767,22 @@ function App() {
                   </div>
                 ) : null}
 
-                <div className="move-preview-table data-grid" role="table" aria-label="Move copy preview">
-                  {renderGridHeader(["Name", "Action", "Source", "Destination"], "move", gridColumnWidths.move, beginGridColumnResize, "move-preview-row")}
-                  {movePreviewItems.length ? (
-                    movePreviewItems.map((item) => (
-                      <div
-                        className="data-grid-row move-preview-row"
-                        role="row"
-                        key={`${item.id}-${item.destinationPath}`}
-                        style={{ gridTemplateColumns: buildGridTemplate(gridColumnWidths.move) }}
-                      >
-                        <span>{item.filename}</span>
-                        <span>{item.reason}</span>
-                        <span>{item.sourcePath}</span>
-                        <span>{item.destinationPath}</span>
-                      </div>
-                    ))
-                  ) : (
-                    <div className="empty-state wide">No preview built yet. Choose a destination and click Build preview.</div>
-                  )}
-                </div>
+                <VirtualDataGrid
+                  labels={["Name", "Action", "Source", "Destination"]}
+                  columnSet="move"
+                  columnWidths={gridColumnWidths.move}
+                  items={movePreviewItems}
+                  rowClassName="move-preview-row"
+                  emptyMessage="No preview built yet. Choose a destination and click Build preview."
+                  getRowKey={(item) => `${item.id}-${item.destinationPath}`}
+                  renderCells={(item) => [
+                    <span key="name">{item.filename}</span>,
+                    <span key="action">{item.reason}</span>,
+                    <span key="source">{item.sourcePath}</span>,
+                    <span key="destination">{item.destinationPath}</span>
+                  ]}
+                  onBeginResize={beginGridColumnResize}
+                />
               </section>
             </>
           ) : null}
@@ -2979,40 +3063,39 @@ function App() {
                       )}
                     </div>
 
-                    <div className="data-grid duplicate-review-table" role="table" aria-label="Duplicate review results">
-                      {renderGridHeader(
-                        ["Select", "Name", "Type", "Size", "Date taken", "Path", "Tags"],
-                        "duplicate",
-                        gridColumnWidths.duplicate,
-                        beginGridColumnResize,
-                        "duplicate-grid-row"
-                      )}
-                      {duplicateItems.map((item) => (
-                        <div
-                          className={`data-grid-row duplicate-grid-row ${selectedFileIds.includes(item.id) ? "selected" : ""}`}
-                          role="row"
-                          key={`${item.path}-duplicate-row`}
-                          onClick={() => activateMediaFile(item.id)}
-                          style={{ gridTemplateColumns: buildGridTemplate(gridColumnWidths.duplicate) }}
-                        >
-                          <span>
-                            <input
-                              type="checkbox"
-                              checked={selectedFileIds.includes(item.id)}
-                              onChange={() => toggleFileSelection(item.id)}
-                              onClick={(event) => event.stopPropagation()}
-                              aria-label={`Select ${item.filename}`}
-                            />
-                          </span>
-                          <span>{item.filename}</span>
-                          <span>{item.extension.toUpperCase()}</span>
-                          <span>{item.fileSizeMb} MB</span>
-                          <span>{formatDate(item.dateTakenUnix)}</span>
-                          <span>{item.path}</span>
-                          <span>{item.tags.join(", ") || "No tags"}</span>
-                        </div>
-                      ))}
-                    </div>
+                    <VirtualDataGrid
+                      labels={["Select", "Name", "Type", "Size", "Date taken", "Path", "Tags"]}
+                      columnSet="duplicate"
+                      columnWidths={gridColumnWidths.duplicate}
+                      items={duplicateItems}
+                      rowClassName="duplicate-grid-row"
+                      emptyMessage={
+                        duplicateScanResult
+                          ? "No files are currently selected for duplicate review."
+                          : "Run Find duplicates to load exact match groups."
+                      }
+                      getRowKey={(item) => `${item.path}-duplicate-row`}
+                      getRowClassName={(item) => (selectedFileIds.includes(item.id) ? "selected" : "")}
+                      onRowClick={(item) => activateMediaFile(item.id)}
+                      renderCells={(item) => [
+                        <span key="select">
+                          <input
+                            type="checkbox"
+                            checked={selectedFileIds.includes(item.id)}
+                            onChange={() => toggleFileSelection(item.id)}
+                            onClick={(event) => event.stopPropagation()}
+                            aria-label={`Select ${item.filename}`}
+                          />
+                        </span>,
+                        <span key="name">{item.filename}</span>,
+                        <span key="type">{item.extension.toUpperCase()}</span>,
+                        <span key="size">{item.fileSizeMb} MB</span>,
+                        <span key="date">{formatDate(item.dateTakenUnix)}</span>,
+                        <span key="path">{item.path}</span>,
+                        <span key="tags">{item.tags.join(", ") || "No tags"}</span>
+                      ]}
+                      onBeginResize={beginGridColumnResize}
+                    />
                   </div>
 
                   {detailPanelOpen ? (
@@ -3650,33 +3733,33 @@ function App() {
                   </div>
                 ) : null}
 
-                <div className="data-grid" role="table" aria-label="Detailed media results">
-              {renderGridHeader(["Select", "Name", "Type", "Size", "Date taken", "Path"], "media", gridColumnWidths.media, beginGridColumnResize)}
-              {gridMediaFiles.map((item) => (
-                <div
-                  className={`data-grid-row ${selectedFileIds.includes(item.id) ? "selected" : ""}`}
-                  role="row"
-                  key={`${item.path}-row`}
-                  onClick={() => activateMediaFile(item.id)}
-                  style={{ gridTemplateColumns: buildGridTemplate(gridColumnWidths.media) }}
-                >
-                  <span>
-                    <input
-                      type="checkbox"
-                      checked={selectedFileIds.includes(item.id)}
-                      onChange={() => toggleFileSelection(item.id)}
-                      onClick={(event) => event.stopPropagation()}
-                      aria-label={`Select ${item.filename}`}
-                    />
-                  </span>
-                  <span>{item.filename}</span>
-                  <span>{item.extension.toUpperCase()}</span>
-                  <span>{item.fileSizeMb} MB</span>
-                  <span>{formatDate(item.dateTakenUnix)}</span>
-                  <span>{item.path}</span>
-                </div>
-              ))}
-                </div>
+                <VirtualDataGrid
+                  labels={["Select", "Name", "Type", "Size", "Date taken", "Path"]}
+                  columnSet="media"
+                  columnWidths={gridColumnWidths.media}
+                  items={gridMediaFiles}
+                  emptyMessage="No media files found yet. Add a path and start a scan."
+                  getRowKey={(item) => `${item.path}-row`}
+                  getRowClassName={(item) => (selectedFileIds.includes(item.id) ? "selected" : "")}
+                  onRowClick={(item) => activateMediaFile(item.id)}
+                  renderCells={(item) => [
+                    <span key="select">
+                      <input
+                        type="checkbox"
+                        checked={selectedFileIds.includes(item.id)}
+                        onChange={() => toggleFileSelection(item.id)}
+                        onClick={(event) => event.stopPropagation()}
+                        aria-label={`Select ${item.filename}`}
+                      />
+                    </span>,
+                    <span key="name">{item.filename}</span>,
+                    <span key="type">{item.extension.toUpperCase()}</span>,
+                    <span key="size">{item.fileSizeMb} MB</span>,
+                    <span key="date">{formatDate(item.dateTakenUnix)}</span>,
+                    <span key="path">{item.path}</span>
+                  ]}
+                  onBeginResize={beginGridColumnResize}
+                />
               </div>
               {activeSection === "Library" && detailPanelOpen ? (
                 <div
