@@ -24,9 +24,21 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! command -v npm >/dev/null 2>&1; then
+  echo "npm was not found. Install Node.js first."
+  exit 1
+fi
+
 echo "Preparing MediaTagger macOS build..."
 rustup target add aarch64-apple-darwin x86_64-apple-darwin >/dev/null 2>&1 || true
-npm install
+
+if [[ ! -d node_modules ]]; then
+  echo "Installing frontend dependencies..."
+  npm install
+else
+  echo "Refreshing frontend dependencies..."
+  npm install
+fi
 
 if [[ "$UNSIGNED" -eq 1 ]]; then
   echo "Running unsigned macOS build..."
@@ -37,4 +49,11 @@ else
 fi
 
 echo
-echo "Build complete. Check src-tauri/target/release/bundle for .app/.dmg outputs."
+echo "Build complete."
+echo "Bundle output:"
+find src-tauri/target/release/bundle -maxdepth 3 \( -name '*.app' -o -name '*.dmg' -o -name '*.app.tar.gz' -o -name '*.zip' \) -print || true
+echo
+echo "If this is an unsigned first-run build on macOS, you may need:"
+echo "  xattr -dr com.apple.quarantine <path-to-app-or-dmg>"
+echo "and then launch the app with Finder Open, or from Terminal:"
+echo "  open <path-to-app>"

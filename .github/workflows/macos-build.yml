@@ -31,7 +31,36 @@ jobs:
         run: npm install
 
       - name: Build unsigned macOS bundle
-        run: npm run tauri build
+        run: npm run tauri:build:macos:unsigned
+
+      - name: Package app bundle for download
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_PATH="$(find src-tauri/target/release/bundle/macos -maxdepth 1 -name '*.app' | head -n 1)"
+          if [[ -z "${APP_PATH:-}" ]]; then
+            echo "No .app bundle found under src-tauri/target/release/bundle/macos"
+            exit 1
+          fi
+          ditto -c -k --keepParent "$APP_PATH" "${APP_PATH}.zip"
+
+      - name: Summarize unsigned macOS install steps
+        shell: bash
+        run: |
+          {
+            echo "## Unsigned macOS test build"
+            echo
+            echo "Artifacts include the raw \`.app\`, any generated \`.dmg\`, and a zipped \`.app\`."
+            echo
+            echo "If macOS blocks launch on the test machine, run:"
+            echo
+            echo '```bash'
+            echo 'xattr -dr com.apple.quarantine "MediaTagger.app"'
+            echo 'open "MediaTagger.app"'
+            echo '```'
+            echo
+            echo "If Finder still warns, right-click the app and choose **Open** once."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload macOS bundle artifacts
         uses: actions/upload-artifact@v4
@@ -40,4 +69,5 @@ jobs:
           path: |
             src-tauri/target/release/bundle/dmg/*.dmg
             src-tauri/target/release/bundle/macos/*.app
+            src-tauri/target/release/bundle/macos/*.app.zip
           if-no-files-found: error

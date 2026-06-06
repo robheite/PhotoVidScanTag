@@ -375,7 +375,7 @@ Later PDF reports:
 
 ## Scale Assumption
 
-The expected library size is usually thousands of files and may reach the low tens of thousands. The app should use indexed SQLite tables, background scanning, incremental refresh, and virtualized grids/lists, but it does not need an architecture optimized for hundreds of thousands or millions of media files in the first version.
+The expected library size may reach roughly 50,000 to 75,000 files across multiple folders, drives, and network-backed roots. The app should use indexed SQLite tables, background scanning, incremental refresh, and virtualized grids/lists. A backend-driven filtering/paging path is a strong enhanced-performance follow-up if frontend-held filtered result sets still feel sluggish at that scale.
 
 ## Open Questions
 
@@ -387,3 +387,15 @@ The expected library size is usually thousands of files and may reach the low te
 ## Known UI Follow-Ups
 
 - Library details panel: portrait-oriented images can overflow the preview well and visually bleed into the metadata area. The preview container needs stricter image containment and max-height behavior so tall images stay fully inside the details preview region.
+
+## Enhanced Performance Follow-Ups
+
+- Enhanced performance run: move Library filtering, sorting, and paging to a backend-driven query path if large real-world libraries still feel sluggish after frontend virtualization and caching work. This should be considered the next major scaling step for 50,000-75,000 file libraries.
+- Enhanced performance run: add smarter video preview scheduling and further detail-panel lazy loading if heavy video libraries still show CPU spikes or hitching during browsing.
+- Enhanced performance run: profile duplicate scans, filter changes, and resize behavior against larger real datasets to identify any remaining hot paths before the macOS-specific Photos Library pass.
+
+## Scan Status Follow-Ups
+
+- Improve scan status beyond a simple "Scanning" label. Add a staged progress model such as: enumerating roots, walking folders, reading metadata, hashing duplicates, and finalizing cache updates.
+- Investigate lightweight scan progress for slower roots such as NAS or mapped network folders. If exact percentages are too expensive, prefer honest staged progress plus rolling counts for folders visited, files discovered, files processed, and missing files marked.
+- Evaluate an optional two-pass approach for accurate percentages on very large roots: a fast enumeration pass to count candidates, followed by the real metadata scan. This should remain optional because it can increase total scan time on network-backed storage.

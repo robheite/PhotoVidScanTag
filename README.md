@@ -59,6 +59,11 @@ or, once Apple signing/notarization is configured on the Mac:
 npm run tauri:build:macos
 ```
 
-See [MAC_BUILD.md](</E:/New folder/OneDrive/Documents/Bekka File Search and Tag/MAC_BUILD.md>) for the dedicated macOS branch workflow and release checklist.
+See [MAC_BUILD.md](/I:/PhotoVidScanTag/MAC_BUILD.md) for the dedicated macOS branch workflow and release checklist.
 
-For GitHub-hosted unsigned macOS test builds, use the `macOS Build` workflow on the `MAC` branch and download the `MediaTagger-macos-bundle` artifact from the workflow run.
+For GitHub-hosted unsigned macOS test builds, use the `macOS Build` workflow on the `MAC` branch and download the `MediaTagger-macos-bundle` artifact from the workflow run. Prefer the zipped `.app` bundle from the artifact, then on the Mac run:
+
+```bash
+xattr -dr com.apple.quarantine "MediaTagger.app"
+open "MediaTagger.app"
+```

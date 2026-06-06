@@ -25,10 +25,10 @@ An actual distributable macOS build still needs a Mac or a macOS CI runner for:
 
 ## Current macOS prep already done
 
-- Tauri bundle icons now include `icon.icns`
+- Tauri bundle icons include `icon.icns`
 - macOS build scripts are available in `package.json`
-- helper script added at [tools/tauri-build-macos.sh](</E:/New folder/OneDrive/Documents/Bekka File Search and Tag/tools/tauri-build-macos.sh>)
-- GitHub Actions workflow added at [`.github/workflows/macos-build.yml`](</E:/New folder/OneDrive/Documents/Bekka File Search and Tag/.github/workflows/macos-build.yml>) for unsigned macOS test builds
+- helper script: [tools/tauri-build-macos.sh](/I:/PhotoVidScanTag/tools/tauri-build-macos.sh)
+- GitHub Actions workflow: [.github/workflows/macos-build.yml](/I:/PhotoVidScanTag/.github/workflows/macos-build.yml)
 
 ## Recommended build flow on a Mac
 
@@ -52,9 +52,22 @@ npm install
 npm run tauri:build:macos:unsigned
 ```
 
-5. Test the generated app locally.
+5. Check the generated outputs under:
 
-6. After unsigned output looks good, configure Apple signing/notarization on the Mac and run:
+```bash
+src-tauri/target/release/bundle
+```
+
+6. If macOS blocks the unsigned build on first run, clear quarantine and open it:
+
+```bash
+xattr -dr com.apple.quarantine "src-tauri/target/release/bundle/macos/MediaTagger.app"
+open "src-tauri/target/release/bundle/macos/MediaTagger.app"
+```
+
+7. If Finder still warns, right-click the app once and choose **Open**.
+
+8. After unsigned output looks good, configure Apple signing/notarization on the Mac and run:
 
 ```bash
 npm run tauri:build:macos
@@ -67,9 +80,28 @@ If you want the easiest first test without touching local Mac build tooling, use
 1. Push changes to `MAC`, or run the workflow manually from the Actions tab.
 2. Open the `macOS Build` workflow run in GitHub.
 3. Download the `MediaTagger-macos-bundle` artifact.
-4. Move the downloaded `.dmg` or `.app` to the Mac test machine.
+4. Prefer the zipped app bundle:
 
-This workflow currently builds an unsigned macOS bundle for testing. It is the right first step before we wire in Apple signing and notarization.
+```text
+src-tauri/target/release/bundle/macos/MediaTagger.app.zip
+```
+
+5. On the Mac, unzip it, then run:
+
+```bash
+xattr -dr com.apple.quarantine "MediaTagger.app"
+open "MediaTagger.app"
+```
+
+6. If the app still looks blocked, right-click it in Finder and choose **Open** once.
+
+This workflow currently builds an unsigned macOS bundle for testing. That is the right first step before wiring in Apple signing and notarization.
+
+## Why the GitHub build may behave differently from a local Mac build
+
+Local Mac builds often launch more easily because they were created directly on the machine you are testing. A downloaded unsigned artifact from GitHub usually gets quarantined by macOS, which can make it fail to launch until quarantine is removed.
+
+That is a packaging/distribution behavior, not necessarily an app-core failure.
 
 ## Signing / notarization checklist
 
@@ -91,6 +123,7 @@ When we get onto a Mac, the first pass should be:
    - folder picking works
    - scans run
    - previews load
+   - duplicates review and cleanup behave
    - move/copy preview and execution still behave
    - exports write correctly
 4. Fix any platform-specific file-dialog or path behavior

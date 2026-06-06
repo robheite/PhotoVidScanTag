@@ -1,4 +1,5 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import {
   AlertCircle,
@@ -27,7 +28,7 @@ import {
   Settings,
   Tags
 } from "lucide-react";
-import { type ReactNode, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import { memo, type ReactNode, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 
 const sections = [
   { label: "Scan", icon: ScanSearch, enabled: true },
@@ -93,6 +94,12 @@ type MediaFile = {
   width: number | null;
   height: number | null;
   megapixels: number | null;
+  cameraMake: string | null;
+  cameraModel: string | null;
+  lensModel: string | null;
+  aperture: string | null;
+  focalLength: string | null;
+  isoValue: string | null;
   missing: boolean;
   scannedAtUnix: number;
   tags: string[];
@@ -109,16 +116,45 @@ type ScanResponse = {
   cachedFiles: number;
   skippedUnchanged: number;
   missingFiles: number;
+  totalFilesSeen: number;
+  supportedFilesSeen: number;
+  foldersVisited: number;
   errors: string[];
+};
+
+type ScanProgress = {
+  stage: string;
+  scanRoot: string | null;
+  currentPath: string | null;
+  foldersVisited: number;
+  totalFilesSeen: number;
+  supportedFilesSeen: number;
+  filesDiscovered: number;
+  scannedFiles: number;
+  skippedUnchanged: number;
+  errorsCount: number;
 };
 
 type ScanExecutionReport = {
   mode: "refresh" | "full";
+  startedAtUnix: number;
   executedAtUnix: number;
+  durationSeconds: number;
   paths: string[];
   extensions: string[];
   result: ScanResponse;
 };
+
+type DuplicateScanProgress = {
+  stage: string;
+  candidates: number;
+  processed: number;
+  groupsFound: number;
+  hashedFiles: number;
+  currentPath: string | null;
+};
+
+type DuplicateMatchMode = "exact" | "probable";
 
 type ScanRoot = {
   path: string;
@@ -150,10 +186,17 @@ type DuplicateGroup = {
 };
 
 type DuplicateScanResponse = {
+  matchMode: DuplicateMatchMode;
   groups: DuplicateGroup[];
   duplicateFiles: number;
   wastedSizeBytes: number;
   wastedSizeMb: number;
+  hashedFiles: number;
+};
+
+type DuplicateHashWarmResponse = {
+  candidates: number;
+  processed: number;
   hashedFiles: number;
 };
 
@@ -241,6 +284,51 @@ type FilterPreset = {
   dateSourceFilter: DateSourceFilter;
   selectedTagFilter: string | null;
 };
+
+type VideoMetadataResult = {
+  durationSeconds: number | null;
+  width: number | null;
+  height: number | null;
+  durationLabel: string | null;
+  bitrateLabel: string | null;
+  codec: string | null;
+};
+
+type PreviewWarmProgress = {
+  total: number;
+  processed: number;
+  available: number;
+  failed: number;
+  currentFilename: string | null;
+  running: boolean;
+};
+
+type IndexedMediaFile = {
+  file: MediaFile;
+  folderPath: string;
+  extensionLower: string;
+  normalizedTags: string[];
+  searchText: string;
+  takenTime: number | null;
+  normalizedDateSource: DateSourceFilter;
+};
+
+type LimitedQueue = {
+  active: number;
+  limit: number;
+  pending: Array<() => void>;
+};
+
+const videoThumbnailCache = new Map<string, string | null>();
+const videoThumbnailInflight = new Map<string, Promise<string | null>>();
+const videoMetadataCache = new Map<string, VideoMetadataResult>();
+const videoMetadataInflight = new Map<string, Promise<VideoMetadataResult>>();
+const nativeImagePreviewCache = new Map<string, string | null>();
+const nativeImagePreviewInflight = new Map<string, Promise<string | null>>();
+const imageMetadataHydrationAttempts = new Set<number>();
+const videoThumbnailQueue: LimitedQueue = { active: 0, limit: 2, pending: [] };
+const videoMetadataQueue: LimitedQueue = { active: 0, limit: 2, pending: [] };
+const nativeImagePreviewQueue: LimitedQueue = { active: 0, limit: 2, pending: [] };
 type GridColumnSet = "media" | "duplicate" | "move";
 
 type OperationHistoryEntry = {
@@ -495,7 +583,9 @@ function App() {
   const [scanFolders, setScanFolders] = useState<ScanFolder[]>([]);
   const [tags, setTags] = useState<TagSummary[]>([]);
   const [scanResult, setScanResult] = useState<ScanResponse | null>(null);
+  const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
   const [lastScanExecutionReport, setLastScanExecutionReport] = useState<ScanExecutionReport | null>(null);
+  const [previewWarmProgress, setPreviewWarmProgress] = useState<PreviewWarmProgress | null>(null);
   const [status, setStatus] = useState("Ready");
   const [isScanning, setIsScanning] = useState(false);
   const [searchText, setSearchText] = useState("");
@@ -527,13 +617,20 @@ function App() {
   const [thumbnailSize, setThumbnailSize] = useState<ThumbnailSize>("medium");
   const [libraryPageSize, setLibraryPageSize] = useState<number>(50);
   const [libraryPage, setLibraryPage] = useState<number>(1);
+  const [libraryTableOpen, setLibraryTableOpen] = useState(true);
+  const [libraryTableHeight, setLibraryTableHeight] = useState<number>(320);
+  const [scanTableHeight, setScanTableHeight] = useState<number>(320);
   const [activeMediaId, setActiveMediaId] = useState<number | null>(null);
+  const [magnifiedMediaId, setMagnifiedMediaId] = useState<number | null>(null);
   const [detailPanelOpen, setDetailPanelOpen] = useState(true);
   const [detailPanelWidth, setDetailPanelWidth] = useState(320);
   const [duplicateGroups, setDuplicateGroups] = useState<DuplicateGroup[]>([]);
   const [duplicateScanResult, setDuplicateScanResult] = useState<DuplicateScanResponse | null>(null);
+  const [duplicateScanProgress, setDuplicateScanProgress] = useState<DuplicateScanProgress | null>(null);
   const [activeDuplicateGroupKey, setActiveDuplicateGroupKey] = useState<string | null>(null);
   const [isFindingDuplicates, setIsFindingDuplicates] = useState(false);
+  const [duplicateMatchMode, setDuplicateMatchMode] = useState<DuplicateMatchMode>("exact");
+  const [isWarmingDuplicateHashes, setIsWarmingDuplicateHashes] = useState(false);
   const [moveMode, setMoveMode] = useState<MoveMode>("copy");
   const [moveScope, setMoveScope] = useState<MoveScope>("selected");
   const [moveDestination, setMoveDestination] = useState("");
@@ -555,7 +652,13 @@ function App() {
   const [duplicateCleanupCollisionPolicy, setDuplicateCleanupCollisionPolicy] = useState<MoveCollisionPolicy>("skip");
   const [duplicateCleanupConfirmed, setDuplicateCleanupConfirmed] = useState(false);
   const [isCleaningDuplicates, setIsCleaningDuplicates] = useState(false);
+  const [duplicateMovePanelOpen, setDuplicateMovePanelOpen] = useState(false);
+  const [deleteDuplicateConfirmOpen, setDeleteDuplicateConfirmOpen] = useState(false);
+  const [skipDeleteWarningThisSession, setSkipDeleteWarningThisSession] = useState(false);
+  const [skipDeleteWarningDraft, setSkipDeleteWarningDraft] = useState(false);
   const detailResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
+  const libraryTableResizeRef = useRef<{ startY: number; startHeight: number } | null>(null);
+  const scanTableResizeRef = useRef<{ startY: number; startHeight: number } | null>(null);
   const [panelSplitWidths, setPanelSplitWidths] = useState<Record<SplitSection, number>>({
     Scan: 520,
     Library: 520,
@@ -564,6 +667,7 @@ function App() {
     Settings: 520
   });
   const splitResizeRef = useRef<{ section: SplitSection; startX: number; startWidth: number } | null>(null);
+  const previewWarmRunRef = useRef(0);
   const [gridColumnWidths, setGridColumnWidths] = useState<Record<GridColumnSet, number[]>>({
     media: [52, 240, 90, 96, 128, 420],
     duplicate: [52, 220, 90, 96, 128, 360, 220],
@@ -574,6 +678,56 @@ function App() {
   useEffect(() => {
     void initializeAppData();
   }, []);
+
+  useEffect(() => {
+    let active = true;
+    let unlisten: (() => void) | null = null;
+
+    void listen<ScanProgress>("scan-progress", (event) => {
+      if (!active) {
+        return;
+      }
+      setScanProgress(event.payload);
+      setStatus(formatScanProgressStatus(event.payload));
+    }).then((dispose) => {
+      if (!active) {
+        dispose();
+        return;
+      }
+      unlisten = dispose;
+    });
+
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    let unlisten: (() => void) | null = null;
+
+    void listen<DuplicateScanProgress>("duplicate-progress", (event) => {
+      if (!active) {
+        return;
+      }
+      setDuplicateScanProgress(event.payload);
+      if (isFindingDuplicates || isWarmingDuplicateHashes) {
+        setStatus(formatDuplicateProgressStatus(event.payload));
+      }
+    }).then((dispose) => {
+      if (!active) {
+        dispose();
+        return;
+      }
+      unlisten = dispose;
+    });
+
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, [isFindingDuplicates, isWarmingDuplicateHashes]);
 
   const extensionGroups = useMemo(() => groupExtensions(availableExtensions), [availableExtensions]);
   const extensionFilterOptions = useMemo(
@@ -597,6 +751,23 @@ function App() {
   const parsedMaxFileSizeMb = useMemo(() => parseFilterNumber(maxFileSizeMb), [maxFileSizeMb]);
   const parsedMinMegapixels = useMemo(() => parseFilterNumber(minMegapixels), [minMegapixels]);
   const parsedMaxMegapixels = useMemo(() => parseFilterNumber(maxMegapixels), [maxMegapixels]);
+  const selectedTagFilterLower = useMemo(() => selectedTagFilter?.toLowerCase() ?? null, [selectedTagFilter]);
+  const mediaIndex = useMemo<IndexedMediaFile[]>(
+    () =>
+      mediaFiles.map((file) => ({
+        file,
+        folderPath: fileFolderPath(file.path),
+        extensionLower: file.extension.toLowerCase(),
+        normalizedTags: file.tags.map((tag) => tag.toLowerCase()),
+        searchText: [file.filename, file.extension, file.mediaType, file.path, file.scanRoot, file.tags.join(" ")]
+          .join(" ")
+          .toLowerCase(),
+        takenTime: resolveMoveDate(file, "taken")?.getTime() ?? null,
+        normalizedDateSource: normalizeDateSourceFilter(file.dateSource)
+      })),
+    [mediaFiles]
+  );
+  const mediaSearchTextById = useMemo(() => new Map(mediaIndex.map((entry) => [entry.file.id, entry.searchText])), [mediaIndex]);
 
   const folderTree = useMemo(() => buildFolderTree(scanPaths, scanFolders, mediaFiles), [scanPaths, scanFolders, mediaFiles]);
   const allFolderPaths = useMemo(() => collectNodePaths(folderTree), [folderTree]);
@@ -631,6 +802,20 @@ function App() {
         return;
       }
 
+      if (libraryTableResizeRef.current) {
+        const delta = libraryTableResizeRef.current.startY - event.clientY;
+        const nextHeight = Math.min(640, Math.max(160, libraryTableResizeRef.current.startHeight + delta));
+        setLibraryTableHeight(nextHeight);
+        return;
+      }
+
+      if (scanTableResizeRef.current) {
+        const delta = scanTableResizeRef.current.startY - event.clientY;
+        const nextHeight = Math.min(640, Math.max(160, scanTableResizeRef.current.startHeight + delta));
+        setScanTableHeight(nextHeight);
+        return;
+      }
+
       if (!detailResizeRef.current) {
         if (splitResizeRef.current) {
           const delta = event.clientX - splitResizeRef.current.startX;
@@ -650,6 +835,8 @@ function App() {
 
     const handleMouseUp = () => {
       gridResizeRef.current = null;
+      libraryTableResizeRef.current = null;
+      scanTableResizeRef.current = null;
       detailResizeRef.current = null;
       splitResizeRef.current = null;
       document.body.style.cursor = "";
@@ -666,115 +853,95 @@ function App() {
 
   const visibleMediaFiles = useMemo(() => {
     const query = deferredSearchText.trim().toLowerCase();
-    const folderFilteredFiles = allFolderPaths.length
-      ? mediaFiles.filter((file) => selectedFolderSet.has(fileFolderPath(file.path)))
-      : mediaFiles;
-    const tagFilteredFiles = selectedTagFilter
-      ? folderFilteredFiles.filter((file) => file.tags.includes(selectedTagFilter))
-      : folderFilteredFiles;
-    const multiTagFilteredFiles = parsedTagFilters.length
-      ? tagFilteredFiles.filter((file) => {
-          const normalizedTags = file.tags.map((tag) => tag.toLowerCase());
-          return tagMatchMode === "all"
-            ? parsedTagFilters.every((tag) => normalizedTags.includes(tag))
-            : parsedTagFilters.some((tag) => normalizedTags.includes(tag));
-        })
-      : tagFilteredFiles;
-    const missingFilteredFiles = multiTagFilteredFiles.filter((file) => {
+    const fromTime = deferredDateFromInput ? new Date(`${deferredDateFromInput}T00:00:00`).getTime() : null;
+    const toTime = deferredDateToInput ? new Date(`${deferredDateToInput}T23:59:59`).getTime() : null;
+    const filteredFiles: MediaFile[] = [];
+
+    for (const entry of mediaIndex) {
+      const file = entry.file;
+
+      if (allFolderPaths.length && !selectedFolderSet.has(entry.folderPath)) {
+        continue;
+      }
+
+      if (selectedTagFilterLower && !entry.normalizedTags.includes(selectedTagFilterLower)) {
+        continue;
+      }
+
+      if (parsedTagFilters.length) {
+        const hasMatch =
+          tagMatchMode === "all"
+            ? parsedTagFilters.every((tag) => entry.normalizedTags.includes(tag))
+            : parsedTagFilters.some((tag) => entry.normalizedTags.includes(tag));
+        if (!hasMatch) {
+          continue;
+        }
+      }
+
       if (missingFilterMode === "only") {
-        return file.missing;
+        if (!file.missing) {
+          continue;
+        }
+      } else if (missingFilterMode === "hide" && file.missing) {
+        continue;
       }
 
-      if (missingFilterMode === "include") {
-        return true;
-      }
-
-      return !file.missing;
-    });
-    const datedFilteredFiles = missingFilteredFiles.filter((file) => {
-      if (!deferredDateFromInput && !deferredDateToInput) {
-        return true;
-      }
-
-      const filterDate = resolveMoveDate(file, "taken");
-      if (!filterDate) {
-        return false;
-      }
-
-      const filterTime = filterDate.getTime();
-      if (deferredDateFromInput) {
-        const fromTime = new Date(`${deferredDateFromInput}T00:00:00`).getTime();
-        if (filterTime < fromTime) {
-          return false;
+      if (fromTime !== null || toTime !== null) {
+        if (entry.takenTime === null) {
+          continue;
+        }
+        if (fromTime !== null && entry.takenTime < fromTime) {
+          continue;
+        }
+        if (toTime !== null && entry.takenTime > toTime) {
+          continue;
         }
       }
 
-      if (deferredDateToInput) {
-        const toTime = new Date(`${deferredDateToInput}T23:59:59`).getTime();
-        if (filterTime > toTime) {
-          return false;
-        }
-      }
-
-      return true;
-    });
-    const metadataFilteredFiles = datedFilteredFiles.filter((file) => {
-      if (dateSourceFilter !== "all") {
-        const normalizedSource = normalizeDateSourceFilter(file.dateSource);
-        if (normalizedSource !== dateSourceFilter) {
-          return false;
-        }
+      if (dateSourceFilter !== "all" && entry.normalizedDateSource !== dateSourceFilter) {
+        continue;
       }
 
       if (parsedMinFileSizeMb !== null && file.fileSizeMb < parsedMinFileSizeMb) {
-        return false;
+        continue;
       }
 
       if (parsedMaxFileSizeMb !== null && file.fileSizeMb > parsedMaxFileSizeMb) {
-        return false;
+        continue;
       }
 
-      if (parsedMinMegapixels !== null) {
-        if (file.megapixels === null || file.megapixels < parsedMinMegapixels) {
-          return false;
-        }
+      if (parsedMinMegapixels !== null && (file.megapixels === null || file.megapixels < parsedMinMegapixels)) {
+        continue;
       }
 
-      if (parsedMaxMegapixels !== null) {
-        if (file.megapixels === null || file.megapixels > parsedMaxMegapixels) {
-          return false;
-        }
+      if (parsedMaxMegapixels !== null && (file.megapixels === null || file.megapixels > parsedMaxMegapixels)) {
+        continue;
       }
 
-      return true;
-    });
-    const mediaTypeFilteredFiles =
-      mediaTypeFilter === "all"
-        ? metadataFilteredFiles
-        : metadataFilteredFiles.filter((file) => file.mediaType === mediaTypeFilter);
-    const extensionFilteredFiles =
-      extensionFilter === "all"
-        ? mediaTypeFilteredFiles
-        : mediaTypeFilteredFiles.filter((file) => file.extension.toLowerCase() === extensionFilter);
+      if (mediaTypeFilter !== "all" && file.mediaType !== mediaTypeFilter) {
+        continue;
+      }
 
-    if (!query) {
-      return extensionFilteredFiles;
+      if (extensionFilter !== "all" && entry.extensionLower !== extensionFilter) {
+        continue;
+      }
+
+      if (query && !entry.searchText.includes(query)) {
+        continue;
+      }
+
+      filteredFiles.push(file);
     }
 
-    return extensionFilteredFiles.filter((file) =>
-      [file.filename, file.extension, file.mediaType, file.path, file.scanRoot]
-        .join(" ")
-        .toLowerCase()
-        .includes(query)
-    );
+    return filteredFiles;
   }, [
     allFolderPaths.length,
+    dateSourceFilter,
     deferredDateFromInput,
     deferredDateToInput,
     deferredSearchText,
-    dateSourceFilter,
     extensionFilter,
-    mediaFiles,
+    mediaIndex,
     mediaTypeFilter,
     missingFilterMode,
     parsedMaxFileSizeMb,
@@ -783,26 +950,31 @@ function App() {
     parsedMinMegapixels,
     parsedTagFilters,
     selectedFolderSet,
-    selectedTagFilter,
+    selectedTagFilterLower,
     tagMatchMode
   ]);
 
   const previewMediaFiles = useMemo(() => visibleMediaFiles.slice(0, scanPreviewLimit), [visibleMediaFiles]);
+  const duplicateSearchIndex = useMemo(
+    () =>
+      duplicateGroups.map((group) => ({
+        group,
+        searchText: group.items
+          .map((item) => mediaSearchTextById.get(item.id) ?? [item.filename, item.extension, item.mediaType, item.path, item.scanRoot, item.tags.join(" ")].join(" ").toLowerCase())
+          .join(" ")
+      })),
+    [duplicateGroups, mediaSearchTextById]
+  );
   const filteredDuplicateGroups = useMemo(() => {
     const query = deferredSearchText.trim().toLowerCase();
     if (!query) {
       return duplicateGroups;
     }
 
-    return duplicateGroups.filter((group) =>
-      group.items.some((item) =>
-        [item.filename, item.extension, item.mediaType, item.path, item.scanRoot, item.tags.join(" ")]
-          .join(" ")
-          .toLowerCase()
-          .includes(query)
-      )
-    );
-  }, [deferredSearchText, duplicateGroups]);
+    return duplicateSearchIndex
+      .filter((entry) => entry.searchText.includes(query))
+      .map((entry) => entry.group);
+  }, [deferredSearchText, duplicateGroups, duplicateSearchIndex]);
   const activeDuplicateGroup = useMemo(
     () =>
       filteredDuplicateGroups.find((group) => group.key === activeDuplicateGroupKey) ??
@@ -833,6 +1005,22 @@ function App() {
     () => duplicateItems.filter((item) => selectedFileIdSet.has(item.id)),
     [duplicateItems, selectedFileIdSet]
   );
+  const selectedDuplicateItemsGlobal = useMemo(() => {
+    const seenIds = new Set<number>();
+    const selectedItems: MediaFile[] = [];
+
+    for (const group of duplicateGroups) {
+      for (const item of group.items) {
+        if (seenIds.has(item.id) || !selectedFileIdSet.has(item.id)) {
+          continue;
+        }
+        seenIds.add(item.id);
+        selectedItems.push(item);
+      }
+    }
+
+    return selectedItems;
+  }, [duplicateGroups, selectedFileIdSet]);
   const selectedDuplicateCount = useMemo(
     () => selectedDuplicateItems.length,
     [selectedDuplicateItems]
@@ -841,15 +1029,30 @@ function App() {
     () => selectedDuplicateItems.reduce((total, item) => total + item.fileSizeBytes, 0),
     [selectedDuplicateItems]
   );
+  const selectedDuplicateGlobalCount = useMemo(
+    () => selectedDuplicateItemsGlobal.length,
+    [selectedDuplicateItemsGlobal]
+  );
+  const selectedDuplicateGlobalBytes = useMemo(
+    () => selectedDuplicateItemsGlobal.reduce((total, item) => total + item.fileSizeBytes, 0),
+    [selectedDuplicateItemsGlobal]
+  );
+  const warmableNativePreviewFiles = useMemo(
+    () =>
+      mediaFiles.filter(
+        (item) => !item.missing && scanPaths.includes(item.scanRoot) && canNativePreviewExtension(item.extension)
+      ),
+    [mediaFiles, scanPaths]
+  );
   const selectedFolderFileIds = useMemo(() => {
     if (!allFolderPaths.length) {
       return [];
     }
 
-    return mediaFiles
-      .filter((file) => !file.missing && selectedFolderSet.has(fileFolderPath(file.path)))
-      .map((file) => file.id);
-  }, [allFolderPaths.length, mediaFiles, selectedFolderSet]);
+    return mediaIndex
+      .filter((entry) => !entry.file.missing && selectedFolderSet.has(entry.folderPath))
+      .map((entry) => entry.file.id);
+  }, [allFolderPaths.length, mediaIndex, selectedFolderSet]);
   const activeMediaItem = useMemo(
     () =>
       activeMediaCollection.find((item) => item.id === activeMediaId) ??
@@ -857,6 +1060,10 @@ function App() {
       activeMediaCollection[0] ??
       null,
     [activeMediaCollection, activeMediaId, selectedFileIdSet]
+  );
+  const magnifiedMediaItem = useMemo(
+    () => mediaFiles.find((item) => item.id === magnifiedMediaId) ?? null,
+    [mediaFiles, magnifiedMediaId]
   );
   const activeDuplicateIsSelected = useMemo(
     () => Boolean(activeMediaItem && duplicateItemIds.includes(activeMediaItem.id) && selectedFileIdSet.has(activeMediaItem.id)),
@@ -868,7 +1075,16 @@ function App() {
   const duplicateFileCount = duplicateScanResult?.duplicateFiles ?? duplicateGroups.reduce((sum, group) => sum + group.fileCount, 0);
   const duplicateWasteMb =
     duplicateScanResult?.wastedSizeMb ?? duplicateGroups.reduce((sum, group) => sum + group.wastedSizeMb, 0);
-  const isBusy = isScanning || isFindingDuplicates || isExecutingMoveCopy;
+  const isBusy = isScanning || isFindingDuplicates || isExecutingMoveCopy || isWarmingDuplicateHashes;
+  const activeDuplicateMode = duplicateScanResult?.matchMode ?? duplicateMatchMode;
+  const duplicateReviewReadOnly = activeDuplicateMode === "probable";
+  const scanDiscoveredProgressRatio = useMemo(() => {
+    if (!scanProgress || !scanProgress.supportedFilesSeen) {
+      return null;
+    }
+
+    return Math.max(0, Math.min(1, scanProgress.scannedFiles / Math.max(scanProgress.supportedFilesSeen, 1)));
+  }, [scanProgress]);
   const selectedFiles = useMemo(
     () => mediaFiles.filter((item) => selectedFileIdSet.has(item.id)),
     [mediaFiles, selectedFileIdSet]
@@ -879,11 +1095,13 @@ function App() {
       case "selected":
         return selectedFiles;
       case "folders":
-        return mediaFiles.filter((item) => moveSelectedFolderSet.has(fileFolderPath(item.path)));
+        return mediaIndex
+          .filter((entry) => moveSelectedFolderSet.has(entry.folderPath))
+          .map((entry) => entry.file);
       default:
         return mediaFiles;
     }
-  }, [mediaFiles, moveScope, moveSelectedFolderSet, selectedFiles]);
+  }, [mediaFiles, mediaIndex, moveScope, moveSelectedFolderSet, selectedFiles]);
   const moveEligibleFiles = useMemo(
     () => moveSourceFiles.filter((item) => !item.missing),
     [moveSourceFiles]
@@ -898,6 +1116,11 @@ function App() {
         selectedFileIdSet.has(item.id) ? "selected" : ""
       } ${activeMediaItem?.id === item.id ? "active-item" : ""}`}
       onClick={() => activateMediaFile(item.id)}
+      onDoubleClick={() => {
+        if (activeSection === "Library" && !item.missing) {
+          setMagnifiedMediaId(item.id);
+        }
+      }}
       title={`${item.filename} | ${item.path}`}
       style={{
         width: `${activeThumbnailDimensions.width}px`,
@@ -947,6 +1170,27 @@ function App() {
   }, [activeMediaCollection, activeMediaItem]);
 
   useEffect(() => {
+    if (magnifiedMediaId !== null && !magnifiedMediaItem) {
+      setMagnifiedMediaId(null);
+    }
+  }, [magnifiedMediaId, magnifiedMediaItem]);
+
+  useEffect(() => {
+    if (!magnifiedMediaItem) {
+      return;
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setMagnifiedMediaId(null);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [magnifiedMediaItem]);
+
+  useEffect(() => {
     if (!filteredDuplicateGroups.length) {
       setActiveDuplicateGroupKey(null);
       return;
@@ -956,6 +1200,54 @@ function App() {
       setActiveDuplicateGroupKey(filteredDuplicateGroups[0].key);
     }
   }, [activeDuplicateGroup, filteredDuplicateGroups]);
+
+  useEffect(() => {
+    if (
+      !activeMediaItem ||
+      activeMediaItem.missing ||
+      activeMediaItem.mediaType === "video" ||
+      imageMetadataHydrationAttempts.has(activeMediaItem.id) ||
+      (
+        activeMediaItem.width !== null &&
+        activeMediaItem.height !== null &&
+        activeMediaItem.cameraMake !== null &&
+        activeMediaItem.cameraModel !== null &&
+        activeMediaItem.dateSource?.toLowerCase().includes("metadata")
+      )
+    ) {
+      return;
+    }
+
+    let cancelled = false;
+    imageMetadataHydrationAttempts.add(activeMediaItem.id);
+
+    void invoke<MediaFile>("hydrate_media_dimensions", { fileId: activeMediaItem.id })
+      .then((hydratedFile) => {
+        if (cancelled) {
+          return;
+        }
+        setMediaFiles((current) =>
+          current.map((file) => (file.id === hydratedFile.id ? hydratedFile : file))
+        );
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          imageMetadataHydrationAttempts.delete(activeMediaItem.id);
+          console.warn("Failed to hydrate image dimensions", error);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    activeMediaItem?.id,
+    activeMediaItem?.path,
+    activeMediaItem?.mediaType,
+    activeMediaItem?.width,
+    activeMediaItem?.height,
+    activeMediaItem?.missing
+  ]);
 
   async function initializeAppData() {
     try {
@@ -1035,6 +1327,24 @@ function App() {
     document.body.style.userSelect = "none";
   }
 
+  function beginLibraryTableResize(clientY: number) {
+    libraryTableResizeRef.current = {
+      startY: clientY,
+      startHeight: libraryTableHeight
+    };
+    document.body.style.cursor = "row-resize";
+    document.body.style.userSelect = "none";
+  }
+
+  function beginScanTableResize(clientY: number) {
+    scanTableResizeRef.current = {
+      startY: clientY,
+      startHeight: scanTableHeight
+    };
+    document.body.style.cursor = "row-resize";
+    document.body.style.userSelect = "none";
+  }
+
   async function chooseScanFolder() {
     const selected = await open({
       directory: true,
@@ -1056,7 +1366,56 @@ function App() {
   }
 
   function removeScanPath(path: string) {
-    setScanPaths((currentPaths) => currentPaths.filter((currentPath) => currentPath !== path));
+    const confirmed = window.confirm(
+      `Remove ${path} from the saved library and future scans?\n\nThis will remove its cached files and folders from the app.`
+    );
+
+    if (!confirmed) {
+      return;
+    }
+
+    void (async () => {
+      try {
+        await invoke("remove_scan_root", { path });
+        const [files, roots, folders, savedTags, history] = await Promise.all([
+          invoke<MediaFile[]>("list_media"),
+          invoke<ScanRoot[]>("list_scan_roots"),
+          invoke<ScanFolder[]>("list_scan_folders"),
+          invoke<TagSummary[]>("list_tags"),
+          invoke<OperationHistoryEntry[]>("list_operation_history")
+        ]);
+        const nextScanPaths = scanPaths.filter((currentPath) => currentPath !== path);
+        setMediaFiles(files);
+        setScanRoots(roots);
+        setScanFolders(folders);
+        setTags(savedTags);
+        setOperationHistory(history);
+        setScanPaths(nextScanPaths);
+        setSelectedFileIds((currentIds) =>
+          currentIds.filter((id) => files.some((file) => file.id === id))
+        );
+        const nextTree = buildFolderTree(nextScanPaths, folders, files);
+        const nextKnownPaths = collectNodePaths(nextTree);
+        setSelectedFolderPaths((currentPaths) =>
+          mergeKnownPaths(
+            currentPaths.filter((currentPath) => currentPath !== path),
+            nextKnownPaths
+          )
+        );
+        setExpandedFolderPaths((currentPaths) =>
+          currentPaths.filter((currentPath) => currentPath !== path && nextKnownPaths.includes(currentPath))
+        );
+        setMoveSelectedFolderPaths((currentPaths) =>
+          currentPaths.filter((currentPath) => currentPath !== path && nextKnownPaths.includes(currentPath))
+        );
+        setMoveExpandedFolderPaths((currentPaths) =>
+          currentPaths.filter((currentPath) => currentPath !== path && nextKnownPaths.includes(currentPath))
+        );
+        setStatus(`Removed ${path} from the saved library`);
+      } catch (error) {
+        setStatus(`Failed to remove ${path}: ${String(error)}`);
+      }
+    })();
   }
 
   async function runScan(forceRescan = false) {
@@ -1065,12 +1424,16 @@ function App() {
       return;
     }
 
+    cancelPreviewWarmup();
     setIsScanning(true);
+    setScanProgress(null);
+    const startedAtUnix = Math.floor(Date.now() / 1000);
     setStatus(forceRescan ? "Running full scan across selected paths..." : "Refreshing selected paths for new, changed, or missing files...");
     try {
       const result = await invoke<ScanResponse>("scan_media", {
         request: { paths: scanPaths, extensions: selectedExtensions, forceRescan }
       });
+      const executedAtUnix = Math.floor(Date.now() / 1000);
       const files = await invoke<MediaFile[]>("list_media");
       const roots = await invoke<ScanRoot[]>("list_scan_roots");
       const folders = await invoke<ScanFolder[]>("list_scan_folders");
@@ -1079,7 +1442,9 @@ function App() {
       setScanResult(result);
       setLastScanExecutionReport({
         mode: forceRescan ? "full" : "refresh",
-        executedAtUnix: Math.floor(Date.now() / 1000),
+        startedAtUnix,
+        executedAtUnix,
+        durationSeconds: Math.max(0, executedAtUnix - startedAtUnix),
         paths: [...scanPaths],
         extensions: [...selectedExtensions],
         result
@@ -1119,30 +1484,42 @@ function App() {
       return;
     }
 
+    const scanScopeFiles = mediaFiles.filter((item) => lastScanExecutionReport.paths.includes(item.scanRoot));
+    const scanScopeMediaFiles = scanScopeFiles.filter((item) => !item.missing);
+    const extensionBreakdown = [...scanScopeMediaFiles.reduce((map, item) => {
+      const key = item.extension.toUpperCase();
+      map.set(key, (map.get(key) ?? 0) + 1);
+      return map;
+    }, new Map<string, number>()).entries()].sort((a, b) => a[0].localeCompare(b[0]));
+    const rootSummaries = lastScanExecutionReport.paths.map((rootPath) => {
+      const filesForRoot = scanScopeFiles.filter((item) => item.scanRoot === rootPath);
+      const mediaForRoot = filesForRoot.filter((item) => !item.missing);
+      const foldersForRoot = scanFolders.filter((folder) => folder.scanRoot === rootPath && !folder.missing && folder.path !== rootPath);
+      return {
+        rootPath,
+        folderCount: foldersForRoot.length,
+        mediaCount: mediaForRoot.length,
+        missingCount: filesForRoot.filter((item) => item.missing).length
+      };
+    });
+
     const summaryLines = [
-      ["Executed at", formatDateTime(lastScanExecutionReport.executedAtUnix)],
+      ["Scan start", formatDateTime(lastScanExecutionReport.startedAtUnix)],
+      ["Scan end", formatDateTime(lastScanExecutionReport.executedAtUnix)],
+      ["Duration", formatDuration(lastScanExecutionReport.durationSeconds)],
       ["Scan mode", lastScanExecutionReport.mode === "full" ? "Full scan" : "Refresh scan"],
       ["Selected paths", `${lastScanExecutionReport.paths.length}`],
       ["Selected file types", `${lastScanExecutionReport.extensions.length}`],
+      ["Total files seen", `${lastScanExecutionReport.result.totalFilesSeen}`],
+      ["Supported media files seen", `${lastScanExecutionReport.result.supportedFilesSeen}`],
+      ["Folders visited (including root)", `${lastScanExecutionReport.result.foldersVisited}`],
       ["Processed files", `${lastScanExecutionReport.result.scannedFiles}`],
       ["Cached files", `${lastScanExecutionReport.result.cachedFiles}`],
       ["Unchanged files", `${lastScanExecutionReport.result.skippedUnchanged}`],
       ["Missing files", `${lastScanExecutionReport.result.missingFiles}`],
+      ["Current media records in scope", `${scanScopeMediaFiles.length}`],
       ["Warnings / errors", `${lastScanExecutionReport.result.errors.length}`]
     ];
-    const previewRows = previewMediaFiles.map((item, index) => [
-      index + 1,
-      item.filename,
-      item.fileSizeMb,
-      formatMediaType(item.mediaType),
-      item.extension.toUpperCase(),
-      formatDate(item.dateTakenUnix),
-      item.dateSource ?? "Unknown",
-      formatDimensions(item),
-      item.scanRoot,
-      item.missing ? "Yes" : "No",
-      item.path
-    ]);
 
     const csvLines = [
       ...summaryLines.map((line) => line.map((value) => csvEscape(value)).join(",")),
@@ -1153,11 +1530,23 @@ function App() {
       ["Enabled extensions"].map(csvEscape).join(","),
       lastScanExecutionReport.extensions.map((extension) => csvEscape(`.${extension}`)).join(","),
       "",
-      ["Scan preview files"].map(csvEscape).join(","),
-      ["Row", "Filename", "Size MB", "Type", "Extension", "Date Taken", "Date Source", "Dimensions", "Scan Root", "Missing", "Path"]
+      ["Scan root summary"].map(csvEscape).join(","),
+      ["Root Path", "Folders (excluding root)", "Media Records", "Missing Records"]
         .map(csvEscape)
         .join(","),
-      ...previewRows.map((row) => row.map((value) => csvEscape(String(value))).join(",")),
+      ...rootSummaries.map((row) =>
+        [row.rootPath, row.folderCount, row.mediaCount, row.missingCount]
+          .map((value) => csvEscape(String(value)))
+          .join(",")
+      ),
+      "",
+      ["File type breakdown"].map(csvEscape).join(","),
+      ["Extension", "Count"]
+        .map(csvEscape)
+        .join(","),
+      ...extensionBreakdown.map(([extension, count]) =>
+        [extension, count].map((value) => csvEscape(String(value))).join(",")
+      ),
       ""
     ];
 
@@ -1177,6 +1566,99 @@ function App() {
       setStatus(`Scan summary export failed: ${String(error)}`);
     }
   }
+
+  async function warmNativePreviews() {
+    if (previewWarmProgress?.running) {
+      setStatus("Native preview warm-up is already running in the background");
+      return;
+    }
+
+    if (!warmableNativePreviewFiles.length) {
+      setStatus("No native-preview image files are available for warm-up in the selected scan roots");
+      return;
+    }
+
+    const runId = previewWarmRunRef.current + 1;
+    previewWarmRunRef.current = runId;
+    const total = warmableNativePreviewFiles.length;
+    setPreviewWarmProgress({
+      total,
+      processed: 0,
+      available: 0,
+      failed: 0,
+      currentFilename: null,
+      running: true
+    });
+    setStatus(`Warming native previews for ${total.toLocaleString()} file(s) in the background...`);
+
+    let processed = 0;
+    let available = 0;
+    let failed = 0;
+
+    try {
+      for (const item of warmableNativePreviewFiles) {
+        if (previewWarmRunRef.current !== runId) {
+          return;
+        }
+
+        await waitForNativePreviewQueueIdle();
+        await waitForMainThreadIdle();
+
+        const previewSrc = await loadNativeImagePreview(item.path);
+        if (previewWarmRunRef.current !== runId) {
+          return;
+        }
+
+        processed += 1;
+        if (previewSrc) {
+          available += 1;
+        } else {
+          failed += 1;
+        }
+
+        if (processed % 5 === 0 || processed === total) {
+          setPreviewWarmProgress({
+            total,
+            processed,
+            available,
+            failed,
+            currentFilename: processed < total ? item.filename : null,
+            running: processed < total
+          });
+        }
+
+        await sleep(40);
+      }
+
+      setPreviewWarmProgress({
+        total,
+        processed,
+        available,
+        failed,
+        currentFilename: null,
+        running: false
+      });
+      setStatus(
+        `Native preview warm-up complete: ${available.toLocaleString()} ready, ${failed.toLocaleString()} unavailable`
+      );
+    } catch (error) {
+      setPreviewWarmProgress({
+        total,
+        processed,
+        available,
+        failed,
+        currentFilename: null,
+        running: false
+      });
+      setStatus(`Native preview warm-up failed: ${String(error)}`);
+    }
+  }
+
+  useEffect(() => {
+    if (isBusy) {
+      cancelPreviewWarmup();
+    }
+  }, [isBusy]);
 
   async function exportLibraryReport() {
     if (!visibleMediaFiles.length) {
@@ -1753,6 +2235,23 @@ function App() {
     }
   }
 
+  function cancelPreviewWarmup() {
+    if (!previewWarmProgress?.running) {
+      return;
+    }
+
+    previewWarmRunRef.current += 1;
+    setPreviewWarmProgress((current) =>
+      current
+        ? {
+            ...current,
+            running: false,
+            currentFilename: null
+          }
+        : current
+    );
+  }
+
   async function clearActivityHistory() {
     try {
       await invoke("clear_operation_history");
@@ -1796,6 +2295,7 @@ function App() {
       return;
     }
 
+    cancelPreviewWarmup();
     const plannedItems = movePreviewItems.map((item) => ({ ...item }));
     setIsExecutingMoveCopy(true);
     setStatus(`${moveMode === "copy" ? "Copying" : "Moving"} ${movePreviewItems.length.toLocaleString()} file(s)...`);
@@ -1839,24 +2339,61 @@ function App() {
   }
 
   async function runDuplicateScan() {
+    cancelPreviewWarmup();
+    setDuplicateScanProgress(null);
     setIsFindingDuplicates(true);
-    setStatus("Checking for exact duplicates...");
+    setStatus(
+      duplicateMatchMode === "exact"
+        ? "Checking for exact duplicates..."
+        : "Reviewing likely duplicates by filename, size, and timing..."
+    );
     try {
-      const result = await invoke<DuplicateScanResponse>("find_duplicates");
+      const result = await invoke<DuplicateScanResponse>(
+        duplicateMatchMode === "exact" ? "find_duplicates" : "find_probable_duplicates"
+      );
       setDuplicateGroups(result.groups);
       setDuplicateScanResult(result);
       setActiveDuplicateGroupKey(result.groups[0]?.key ?? null);
       setSelectedFileIds([]);
+      setDuplicateCleanupConfirmed(false);
       await refreshOperationHistory();
       setStatus(
         result.groups.length
-          ? `Found ${result.groups.length.toLocaleString()} duplicate groups across ${result.duplicateFiles.toLocaleString()} files`
-          : "No exact duplicates found"
+          ? `${
+              duplicateMatchMode === "exact" ? "Found" : "Reviewed"
+            } ${result.groups.length.toLocaleString()} ${
+              duplicateMatchMode === "exact" ? "duplicate" : "probable duplicate"
+            } groups across ${result.duplicateFiles.toLocaleString()} files`
+          : duplicateMatchMode === "exact"
+            ? "No exact duplicates found"
+            : "No probable duplicate groups found"
       );
     } catch (error) {
-      setStatus(`Duplicate check failed: ${String(error)}`);
+      setStatus(
+        `${duplicateMatchMode === "exact" ? "Exact" : "Probable"} duplicate check failed: ${String(error)}`
+      );
     } finally {
       setIsFindingDuplicates(false);
+    }
+  }
+
+  async function warmDuplicateHashes() {
+    cancelPreviewWarmup();
+    setDuplicateScanProgress(null);
+    setIsWarmingDuplicateHashes(true);
+    setStatus("Preparing duplicate hash warm-up...");
+    try {
+      const result = await invoke<DuplicateHashWarmResponse>("warm_duplicate_hashes");
+      await refreshOperationHistory();
+      setStatus(
+        result.candidates
+          ? `Duplicate hash warm-up finished: ${result.hashedFiles.toLocaleString()} hashed across ${result.candidates.toLocaleString()} candidate file(s)`
+          : "Duplicate hash warm-up found no pending candidates"
+      );
+    } catch (error) {
+      setStatus(`Duplicate hash warm-up failed: ${String(error)}`);
+    } finally {
+      setIsWarmingDuplicateHashes(false);
     }
   }
 
@@ -1889,6 +2426,27 @@ function App() {
 
     setSelectedFileIds((currentIds) => currentIds.filter((id) => !duplicateItemIds.includes(id)));
     setStatus("Cleared duplicate group selection");
+  }
+
+  function collectDuplicateCleanupPaths() {
+    const selectedPaths = selectedDuplicateItemsGlobal.map((item) => item.path);
+
+    if (!selectedPaths.length) {
+      setStatus("Select one or more duplicate files first");
+      return null;
+    }
+
+    for (const group of duplicateGroups) {
+      const selectedCountInGroup = group.items.filter((item) => selectedFileIdSet.has(item.id)).length;
+      if (group.items.length > 1 && selectedCountInGroup === group.items.length) {
+        setStatus(
+          `All files in duplicate group ${group.items[0]?.filename ?? group.key} are selected. Use Keep active, clean rest or deselect the keeper first.`
+        );
+        return null;
+      }
+    }
+
+    return selectedPaths;
   }
 
   function selectFilesInSelectedFolders() {
@@ -1977,9 +2535,7 @@ function App() {
   }
 
   function sendDuplicateSelectionToMoveCopy() {
-    const duplicateSelectionIds = duplicateItems
-      .filter((item) => selectedFileIdSet.has(item.id))
-      .map((item) => item.id);
+    const duplicateSelectionIds = selectedDuplicateItemsGlobal.map((item) => item.id);
 
     if (!duplicateSelectionIds.length) {
       setStatus("Select one or more duplicate files first");
@@ -1992,35 +2548,33 @@ function App() {
     setStatus(`Sent ${duplicateSelectionIds.length.toLocaleString()} duplicate file(s) to Move/Copy`);
   }
 
-  async function runDuplicateCleanup() {
-    const selectedPaths = duplicateItems.filter((item) => selectedFileIdSet.has(item.id)).map((item) => item.path);
-    if (!selectedPaths.length) {
-      setStatus("Select one or more duplicate files first");
+  async function runDuplicateCleanup(mode: DuplicateCleanupMode) {
+    const selectedPaths = collectDuplicateCleanupPaths();
+    if (!selectedPaths) {
       return;
     }
 
-    if (duplicateItems.length > 1 && selectedDuplicateCount === duplicateItems.length) {
-      setStatus("All files in this duplicate group are selected. Use Keep active, clean rest or deselect the keeper first.");
-      return;
-    }
-
-    if (duplicateCleanupMode === "move" && !duplicateCleanupDestination.trim()) {
+    if (mode === "move" && !duplicateCleanupDestination.trim()) {
       setStatus("Choose a cleanup folder before moving duplicate files");
       return;
     }
 
-    if (!duplicateCleanupConfirmed) {
-      setStatus(
-        duplicateCleanupMode === "delete"
-          ? "Confirm duplicate deletion before running cleanup"
-          : "Confirm duplicate move before running cleanup"
-      );
+    if (mode === "move" && !duplicateCleanupConfirmed) {
+      setStatus("Confirm duplicate move before running cleanup");
       return;
+    }
+
+    const selectedPathSet = new Set(selectedPaths);
+    const activeSelectionWillBeCleaned = activeMediaItem ? selectedPathSet.has(activeMediaItem.path) : false;
+    if (activeSelectionWillBeCleaned) {
+      setActiveMediaId(null);
+      setMagnifiedMediaId(null);
+      await sleep(120);
     }
 
     setIsCleaningDuplicates(true);
     setStatus(
-      duplicateCleanupMode === "delete"
+      mode === "delete"
         ? `Deleting ${selectedPaths.length.toLocaleString()} duplicate file(s)...`
         : `Moving ${selectedPaths.length.toLocaleString()} duplicate file(s) to cleanup folder...`
     );
@@ -2028,22 +2582,26 @@ function App() {
     try {
       const result = await invoke<CleanupDuplicatesResponse>("cleanup_duplicates", {
         request: {
-          mode: duplicateCleanupMode,
+          mode,
           collisionPolicy: duplicateCleanupCollisionPolicy,
-          destinationFolder: duplicateCleanupMode === "move" ? duplicateCleanupDestination : null,
+          destinationFolder: mode === "move" ? duplicateCleanupDestination : null,
           paths: selectedPaths
         }
       });
 
       await initializeAppData();
-      const refreshedDuplicates = await invoke<DuplicateScanResponse>("find_duplicates");
+      const refreshedDuplicates = await invoke<DuplicateScanResponse>(
+        duplicateMatchMode === "probable" ? "find_probable_duplicates" : "find_duplicates"
+      );
       setDuplicateGroups(refreshedDuplicates.groups);
       setDuplicateScanResult(refreshedDuplicates);
       setActiveDuplicateGroupKey(refreshedDuplicates.groups[0]?.key ?? null);
       setSelectedFileIds([]);
       setDuplicateCleanupConfirmed(false);
+      setDeleteDuplicateConfirmOpen(false);
+      setSkipDeleteWarningDraft(false);
 
-      if (duplicateCleanupMode === "delete") {
+      if (mode === "delete") {
         setStatus(
           `Duplicate cleanup finished: ${result.deletedItems.toLocaleString()} deleted, ${result.failedItems.toLocaleString()} failed`
         );
@@ -2057,6 +2615,28 @@ function App() {
     } finally {
       setIsCleaningDuplicates(false);
     }
+  }
+
+  function requestDeleteSelectedDuplicates() {
+    const selectedPaths = collectDuplicateCleanupPaths();
+    if (!selectedPaths) {
+      return;
+    }
+
+    if (skipDeleteWarningThisSession) {
+      void runDuplicateCleanup("delete");
+      return;
+    }
+
+    setSkipDeleteWarningDraft(false);
+    setDeleteDuplicateConfirmOpen(true);
+  }
+
+  function confirmDeleteSelectedDuplicates() {
+    if (skipDeleteWarningDraft) {
+      setSkipDeleteWarningThisSession(true);
+    }
+    void runDuplicateCleanup("delete");
   }
 
   async function applyTagsToSelection() {
@@ -2079,7 +2659,9 @@ function App() {
     });
     const files = await invoke<MediaFile[]>("list_media");
     if (duplicateScanResult) {
-      const refreshedDuplicates = await invoke<DuplicateScanResponse>("find_duplicates");
+      const refreshedDuplicates = await invoke<DuplicateScanResponse>(
+        duplicateScanResult.matchMode === "probable" ? "find_probable_duplicates" : "find_duplicates"
+      );
       setDuplicateGroups(refreshedDuplicates.groups);
       setDuplicateScanResult(refreshedDuplicates);
     }
@@ -2290,7 +2872,9 @@ function App() {
                 : activeSection === "Library"
                   ? "Browse the full visible library, review previews, and apply tags from one place."
                   : activeSection === "Duplicates"
-                    ? "Find exact duplicate files, review each group, and compare paths before any cleanup work."
+                    ? duplicateMatchMode === "exact"
+                      ? "Find exact duplicate files, review each group, and compare paths before any cleanup work."
+                      : "Review likely duplicates grouped by filename, size, and timing heuristics."
                     : activeSection === "Move/Copy"
                       ? "Build a safe move or copy plan, choose a destination, and preview the resulting folder structure."
                       : "Set scan defaults, library defaults, and operational paths for the desktop app."}
@@ -2317,6 +2901,17 @@ function App() {
                 Refresh scan
               </button>
             )}
+            {activeSection === "Duplicates" ? (
+              <button
+                className="secondary-button"
+                onClick={warmDuplicateHashes}
+                disabled={isBusy || duplicateMatchMode !== "exact"}
+                title={duplicateMatchMode === "exact" ? undefined : "Hash warm-up is only used for exact duplicate checks."}
+              >
+                <Hash size={17} />
+                {isWarmingDuplicateHashes ? "Warming hashes" : "Warm hashes"}
+              </button>
+            ) : null}
             <button
               className="primary-button"
               onClick={
@@ -2344,7 +2939,9 @@ function App() {
                 : activeSection === "Duplicates"
                 ? isFindingDuplicates
                   ? "Checking duplicates"
-                  : "Find duplicates"
+                  : duplicateMatchMode === "exact"
+                    ? "Find exact"
+                    : "Find probable"
                 : activeSection === "Move/Copy"
                   ? "Build preview"
                   : isScanning
@@ -2883,13 +3480,19 @@ function App() {
                 <div className="panel-header">
                   <div>
                     <h2>Duplicate Groups</h2>
-                    <p>Exact matches are grouped by content hash so you can review path-by-path before cleanup.</p>
+                    <p>
+                      {activeDuplicateMode === "exact"
+                        ? "Exact matches are grouped by content hash so you can review path-by-path before cleanup."
+                        : "Likely duplicates are grouped by same-name, size, and timing heuristics for manual review."}
+                    </p>
                   </div>
                   <Hash size={20} />
                 </div>
                 <div className="panel-note">
                   <strong>{filteredDuplicateGroups.length.toLocaleString()} groups in view</strong>
-                  <span>{duplicateFileCount.toLocaleString()} duplicate files found so far</span>
+                  <span>
+                    {duplicateFileCount.toLocaleString()} {activeDuplicateMode === "exact" ? "duplicate" : "probable duplicate"} files found so far
+                  </span>
                 </div>
                 <div className="duplicate-group-list">
                   {filteredDuplicateGroups.length ? (
@@ -2912,7 +3515,9 @@ function App() {
                     ))
                   ) : (
                     <div className="empty-state wide">
-                      {duplicateScanResult ? "No duplicate groups match the current search." : "Run Find duplicates to build the review list."}
+                      {duplicateScanResult
+                        ? `No ${activeDuplicateMode === "exact" ? "duplicate" : "probable duplicate"} groups match the current search.`
+                        : `Run Find ${duplicateMatchMode === "exact" ? "exact" : "probable"} to build the review list.`}
                     </div>
                   )}
                 </div>
@@ -2926,8 +3531,10 @@ function App() {
                     <h2>Duplicate Review</h2>
                     <p>
                       {activeDuplicateGroup
-                        ? `Compare ${activeDuplicateGroup.fileCount} exact matches before deciding what to keep.`
-                        : "Select a duplicate group to review its matching files."}
+                        ? `Compare ${activeDuplicateGroup.fileCount} ${
+                            activeDuplicateMode === "exact" ? "exact matches" : "likely matches"
+                          } before deciding what to keep.`
+                        : `Select a ${activeDuplicateMode === "exact" ? "duplicate" : "probable duplicate"} group to review its matching files.`}
                     </p>
                   </div>
                   <div className="view-actions">
@@ -2956,6 +3563,35 @@ function App() {
                   </div>
                 </div>
 
+                <div className="planner-toggle duplicate-mode-toggle">
+                  <button
+                    className={duplicateMatchMode === "exact" ? "active" : ""}
+                    onClick={() => {
+                      setDuplicateMatchMode("exact");
+                      setDuplicateGroups([]);
+                      setDuplicateScanResult(null);
+                      setActiveDuplicateGroupKey(null);
+                      setSelectedFileIds([]);
+                    }}
+                    disabled={isFindingDuplicates || isCleaningDuplicates}
+                  >
+                    Exact
+                  </button>
+                  <button
+                    className={duplicateMatchMode === "probable" ? "active" : ""}
+                    onClick={() => {
+                      setDuplicateMatchMode("probable");
+                      setDuplicateGroups([]);
+                      setDuplicateScanResult(null);
+                      setActiveDuplicateGroupKey(null);
+                      setSelectedFileIds([]);
+                    }}
+                    disabled={isFindingDuplicates || isCleaningDuplicates}
+                  >
+                    Probable
+                  </button>
+                </div>
+
                 <div className="filter-row">
                   <label>
                     <Search size={16} />
@@ -2975,43 +3611,78 @@ function App() {
                   <button onClick={selectDuplicateGroup} disabled={!duplicateItems.length}>
                     Select group
                   </button>
-                  <button onClick={keepActiveDuplicate} disabled={!duplicateItems.length || !activeMediaItem}>
+                  <button onClick={keepActiveDuplicate} disabled={duplicateReviewReadOnly || !duplicateItems.length || !activeMediaItem}>
                     Keep active
                   </button>
-                  <button onClick={keepActiveAndPrepareCleanup} disabled={!duplicateItems.length || !activeMediaItem}>
+                  <button onClick={keepActiveAndPrepareCleanup} disabled={duplicateReviewReadOnly || !duplicateItems.length || !activeMediaItem}>
                     Keep active, clean rest
                   </button>
-                  <button onClick={sendDuplicateSelectionToMoveCopy} disabled={!selectedDuplicateCount}>
+                  <button onClick={sendDuplicateSelectionToMoveCopy} disabled={duplicateReviewReadOnly || !selectedDuplicateGlobalCount}>
                     <MoveRight size={16} />
                     Send to Move/Copy
+                  </button>
+                  <button onClick={requestDeleteSelectedDuplicates} disabled={duplicateReviewReadOnly || !selectedDuplicateGlobalCount || isCleaningDuplicates}>
+                    <AlertCircle size={16} />
+                    {isCleaningDuplicates ? "Running cleanup..." : "Delete selected duplicates"}
                   </button>
                   <button onClick={clearDuplicateGroupSelection} disabled={!selectedDuplicateCount}>
                     Clear group
                   </button>
                   <span className="duplicate-selection-note">
-                    {selectedDuplicateCount.toLocaleString()} selected in this group
+                    {selectedDuplicateGlobalCount.toLocaleString()} selected across duplicate groups
                   </span>
                 </div>
 
-                <div className="planner-section duplicate-cleanup-panel">
-                  <strong>Duplicate cleanup</strong>
-                  <div className="planner-toggle">
-                    <button
-                      className={duplicateCleanupMode === "move" ? "active" : ""}
-                      onClick={() => setDuplicateCleanupMode("move")}
-                    >
-                      Move to cleanup folder
-                    </button>
-                    <button
-                      className={duplicateCleanupMode === "delete" ? "active" : ""}
-                      onClick={() => setDuplicateCleanupMode("delete")}
-                    >
-                      Delete from disk
-                    </button>
+                {duplicateReviewReadOnly ? (
+                  <div className="panel-note duplicate-review-readonly">
+                    <strong>Probable duplicates are review-only</strong>
+                    <span>
+                      This mode groups files by same-name, size, and timing heuristics. Cleanup actions stay disabled so the exact duplicate workflow remains the safe path for deletion.
+                    </span>
                   </div>
+                ) : null}
 
-                  {duplicateCleanupMode === "move" ? (
-                    <>
+                {!duplicateReviewReadOnly ? (
+                <div className="planner-section duplicate-cleanup-panel">
+                  <button
+                    className="collapse-row"
+                    onClick={() => setDuplicateMovePanelOpen((current) => !current)}
+                    aria-expanded={duplicateMovePanelOpen}
+                  >
+                    <strong>Move to cleanup folder</strong>
+                    {duplicateMovePanelOpen ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+                  </button>
+                  <div className="panel-note duplicate-preflight-note">
+                    <strong>Preflight summary</strong>
+                    <span>
+                      {activeMediaItem && duplicateItemIds.includes(activeMediaItem.id)
+                        ? `Keeping ${activeMediaItem.filename}`
+                        : "No keeper chosen yet"}
+                    </span>
+                    <span>
+                      {selectedDuplicateGlobalCount.toLocaleString()} cleanup item(s) selected
+                      {selectedDuplicateGlobalCount ? ` | ${formatFileSize(selectedDuplicateGlobalBytes)} estimated` : ""}
+                    </span>
+                    <span>
+                      {duplicateMovePanelOpen
+                        ? duplicateCleanupDestination
+                          ? `Move extras to ${duplicateCleanupDestination}`
+                          : "Choose a cleanup folder to move extras"
+                        : "Delete selected extras from disk or open move-to-cleanup options"}
+                    </span>
+                    {duplicateItems.length > 1 && selectedDuplicateCount === duplicateItems.length ? (
+                      <span className="duplicate-preflight-warning">
+                        All files in this duplicate group are selected right now. Choose a keeper before cleanup.
+                      </span>
+                    ) : null}
+                    {activeDuplicateIsSelected ? (
+                      <span className="duplicate-preflight-warning">
+                        The active file is included in the cleanup selection.
+                      </span>
+                    ) : null}
+                  </div>
+                  {duplicateMovePanelOpen && !duplicateReviewReadOnly ? (
+                    <div className="duplicate-move-options">
                       <div className="planner-choice-list">
                         <label>
                           <input
@@ -3039,68 +3710,27 @@ function App() {
                           Choose folder
                         </button>
                       </div>
-                    </>
-                  ) : (
-                    <div className="panel-note duplicate-warning-note">
-                      <strong>Permanent delete</strong>
-                      <span>Selected duplicate files will be removed from disk and marked missing in the local scan cache.</span>
+                      <label className="duplicate-confirmation">
+                        <input
+                          type="checkbox"
+                          checked={duplicateCleanupConfirmed}
+                          onChange={(event) => setDuplicateCleanupConfirmed(event.target.checked)}
+                        />
+                        <span>
+                          I understand these selected duplicate files will be moved out of the current library view.
+                        </span>
+                      </label>
+
+                      <div className="detail-actions">
+                        <button onClick={() => void runDuplicateCleanup("move")} disabled={!selectedDuplicateCount || isCleaningDuplicates}>
+                          <FolderOpen size={16} />
+                          {isCleaningDuplicates ? "Running cleanup..." : "Move selected duplicates"}
+                        </button>
+                      </div>
                     </div>
-                  )}
-
-                  <div className="panel-note duplicate-preflight-note">
-                    <strong>Preflight summary</strong>
-                    <span>
-                      {activeMediaItem && duplicateItemIds.includes(activeMediaItem.id)
-                        ? `Keeping ${activeMediaItem.filename}`
-                        : "No keeper chosen yet"}
-                    </span>
-                    <span>
-                      {selectedDuplicateCount.toLocaleString()} cleanup item(s) selected
-                      {selectedDuplicateCount ? ` | ${formatFileSize(selectedDuplicateBytes)} estimated` : ""}
-                    </span>
-                    <span>
-                      {duplicateCleanupMode === "move"
-                        ? duplicateCleanupDestination
-                          ? `Move extras to ${duplicateCleanupDestination}`
-                          : "Choose a cleanup folder to move extras"
-                        : "Delete selected extras from disk"}
-                    </span>
-                    {duplicateItems.length > 1 && selectedDuplicateCount === duplicateItems.length ? (
-                      <span className="duplicate-preflight-warning">
-                        All files in this duplicate group are selected right now. Choose a keeper before cleanup.
-                      </span>
-                    ) : null}
-                    {activeDuplicateIsSelected ? (
-                      <span className="duplicate-preflight-warning">
-                        The active file is included in the cleanup selection.
-                      </span>
-                    ) : null}
-                  </div>
-
-                  <label className="duplicate-confirmation">
-                    <input
-                      type="checkbox"
-                      checked={duplicateCleanupConfirmed}
-                      onChange={(event) => setDuplicateCleanupConfirmed(event.target.checked)}
-                    />
-                    <span>
-                      {duplicateCleanupMode === "delete"
-                        ? "I understand these selected duplicate files will be deleted from disk."
-                        : "I understand these selected duplicate files will be moved out of the current library view."}
-                    </span>
-                  </label>
-
-                  <div className="detail-actions">
-                    <button onClick={runDuplicateCleanup} disabled={!selectedDuplicateCount || isCleaningDuplicates}>
-                      <AlertCircle size={16} />
-                      {isCleaningDuplicates
-                        ? "Running cleanup..."
-                        : duplicateCleanupMode === "delete"
-                          ? "Delete selected duplicates"
-                          : "Move selected duplicates"}
-                    </button>
-                  </div>
+                  ) : null}
                 </div>
+                ) : null}
 
                 <div
                   className={`library-workbench duplicate-review-workbench ${detailPanelOpen ? "" : "details-collapsed"}`}
@@ -3108,8 +3738,8 @@ function App() {
                 >
                   <div className="library-main duplicate-review-main">
                     <div className="duplicate-group-summary">
-                      <span>Hash</span>
-                      <strong>{activeDuplicateGroup ? activeDuplicateGroup.hash.slice(0, 16) : "No group selected"}</strong>
+                      <span>{activeDuplicateMode === "exact" ? "Hash" : "Heuristic"}</span>
+                      <strong>{activeDuplicateGroup ? activeDuplicateGroup.hash.slice(0, 32) : "No group selected"}</strong>
                       {activeDuplicateGroup ? <small>{activeDuplicateGroup.hash}</small> : null}
                     </div>
                     <VirtualMediaGrid
@@ -3120,7 +3750,7 @@ function App() {
                       emptyMessage={
                         duplicateScanResult
                           ? "No files are currently selected for duplicate review."
-                          : "Run Find duplicates to load exact match groups."
+                          : `Run Find ${duplicateMatchMode === "exact" ? "exact" : "probable"} to load match groups.`
                       }
                       getItemKey={(item) => `${activeDuplicateGroup?.key}-${item.path}`}
                       renderItem={(item) => renderSelectableMediaCard(item)}
@@ -3135,7 +3765,7 @@ function App() {
                       emptyMessage={
                         duplicateScanResult
                           ? "No files are currently selected for duplicate review."
-                          : "Run Find duplicates to load exact match groups."
+                          : `Run Find ${duplicateMatchMode === "exact" ? "exact" : "probable"} to load match groups.`
                       }
                       getRowKey={(item) => `${item.path}-duplicate-row`}
                       getRowClassName={(item) => (selectedFileIdSet.has(item.id) ? "selected" : "")}
@@ -3152,7 +3782,7 @@ function App() {
                         </span>,
                         <span key="name">{item.filename}</span>,
                         <span key="type">{item.extension.toUpperCase()}</span>,
-                        <span key="size">{item.fileSizeMb} MB</span>,
+                        <span key="size">{formatFileSize(item.fileSizeBytes)}</span>,
                         <span key="date">{formatDate(item.dateTakenUnix)}</span>,
                         <span key="path">{item.path}</span>,
                         <span key="tags">{item.tags.join(", ") || "No tags"}</span>
@@ -3183,9 +3813,7 @@ function App() {
                       </div>
                       {activeMediaItem ? (
                         <>
-                          <div className="detail-preview">
-                            <DetailPreview item={activeMediaItem} />
-                          </div>
+                          <LazyDetailPreview item={activeMediaItem} />
                           <div className="detail-copy">
                             <strong>{activeMediaItem.filename}</strong>
                             <span>{activeMediaItem.path}</span>
@@ -3197,7 +3825,7 @@ function App() {
                             </div>
                             <div className="detail-row">
                               <span><HardDrive size={14} /> File size</span>
-                              <strong>{activeMediaItem.fileSizeMb} MB</strong>
+                              <strong>{formatFileSize(activeMediaItem.fileSizeBytes)}</strong>
                             </div>
                         <div className="detail-row">
                           <span><CalendarClock size={14} /> Date taken</span>
@@ -3223,7 +3851,7 @@ function App() {
                           <span><HardDrive size={14} /> Scan root</span>
                           <strong>{activeMediaItem.scanRoot}</strong>
                         </div>
-                        {activeMediaItem.mediaType === "video" ? <VideoDetailRows item={activeMediaItem} /> : null}
+                        {activeMediaItem.mediaType === "video" ? <VideoDetailRows item={activeMediaItem} /> : <ImageDetailRows item={activeMediaItem} />}
                       </div>
                           <div className="detail-section">
                             <span className="detail-label">Duplicate group</span>
@@ -3398,23 +4026,81 @@ function App() {
                   <strong>{status}</strong>
                   {scanResult?.errors.length ? <span>{scanResult.errors.length} scan warnings</span> : null}
                 </div>
+                <div className="scan-status-actions">
+                  <button
+                    onClick={() => void warmNativePreviews()}
+                    disabled={isBusy || previewWarmProgress?.running || !warmableNativePreviewFiles.length}
+                  >
+                    <FileImage size={16} />
+                    {previewWarmProgress?.running ? "Warming previews..." : "Warm previews"}
+                  </button>
+                </div>
+                {scanProgress ? (
+                  <div className="planner-section scan-progress-panel">
+                    <div className="move-report-header">
+                      <strong>Current scan progress</strong>
+                      <span>{scanProgress.stage}</span>
+                    </div>
+                    <div className="progress-meter" aria-hidden="true">
+                      <div
+                        className="progress-fill"
+                        style={{ width: `${Math.round((scanDiscoveredProgressRatio ?? 0) * 100)}%` }}
+                      />
+                    </div>
+                    <div className="panel-note">
+                      <strong>
+                        {scanProgress.scannedFiles.toLocaleString()} of {scanProgress.supportedFilesSeen.toLocaleString()} discovered media processed
+                      </strong>
+                      <span>
+                        {scanProgress.scanRoot ? `Root: ${scanProgress.scanRoot}` : "Waiting for scan root information"}
+                      </span>
+                      {scanProgress.currentPath ? <span className="scan-progress-path">{scanProgress.currentPath}</span> : null}
+                    </div>
+                    <div className="scan-progress-grid">
+                      <span><strong>{scanProgress.foldersVisited.toLocaleString()}</strong> folders visited</span>
+                      <span><strong>{scanProgress.totalFilesSeen.toLocaleString()}</strong> total files seen</span>
+                      <span><strong>{scanProgress.supportedFilesSeen.toLocaleString()}</strong> media files seen</span>
+                      <span><strong>{scanProgress.scannedFiles.toLocaleString()}</strong> processed</span>
+                      <span><strong>{scanProgress.skippedUnchanged.toLocaleString()}</strong> unchanged</span>
+                      <span><strong>{scanProgress.errorsCount.toLocaleString()}</strong> errors</span>
+                    </div>
+                  </div>
+                ) : null}
                 {lastScanExecutionReport ? (
                   <div className="planner-section move-report-section">
                     <div className="move-report-header">
                       <strong>Last scan report</strong>
-                      <button onClick={() => void exportScanSummaryReport()}>
-                        <Copy size={16} />
-                        Export CSV
-                      </button>
+                      <div className="move-report-header-actions">
+                        <button onClick={() => void exportScanSummaryReport()}>
+                          <Copy size={16} />
+                          Export CSV
+                        </button>
+                      </div>
                     </div>
                     <div className="move-report-summary">
+                      <span>start {formatDateTime(lastScanExecutionReport.startedAtUnix)}</span>
                       <span>{formatDateTime(lastScanExecutionReport.executedAtUnix)}</span>
+                      <span>{formatDuration(lastScanExecutionReport.durationSeconds)}</span>
                       <span>{lastScanExecutionReport.mode === "full" ? "Full scan" : "Refresh scan"}</span>
                       <span>{lastScanExecutionReport.paths.length.toLocaleString()} paths</span>
                       <span>{lastScanExecutionReport.extensions.length.toLocaleString()} file types</span>
+                      <span>{lastScanExecutionReport.result.totalFilesSeen.toLocaleString()} total files seen</span>
+                      <span>{lastScanExecutionReport.result.supportedFilesSeen.toLocaleString()} media files seen</span>
                       <span>{lastScanExecutionReport.result.scannedFiles.toLocaleString()} processed</span>
                       <span>{lastScanExecutionReport.result.missingFiles.toLocaleString()} missing</span>
                     </div>
+                    {previewWarmProgress ? (
+                      <div className="warm-preview-summary">
+                        <span>
+                          {previewWarmProgress.running ? "Background preview warm-up" : "Last preview warm-up"}:
+                          {" "}
+                          {previewWarmProgress.processed.toLocaleString()}/{previewWarmProgress.total.toLocaleString()} processed
+                        </span>
+                        <span>{previewWarmProgress.available.toLocaleString()} ready</span>
+                        {previewWarmProgress.failed ? <span>{previewWarmProgress.failed.toLocaleString()} unavailable</span> : null}
+                        {previewWarmProgress.currentFilename ? <span>{previewWarmProgress.currentFilename}</span> : null}
+                      </div>
+                    ) : null}
                   </div>
                 ) : null}
                 {scanResult?.errors.length ? (
@@ -3732,6 +4418,9 @@ function App() {
                       </div>
                     </div>
                     <div className="page-nav">
+                      <button onClick={() => setLibraryTableOpen((current) => !current)}>
+                        {libraryTableOpen ? "Hide file list" : "Show file list"}
+                      </button>
                       <button onClick={() => setLibraryPage((current) => Math.max(1, current - 1))} disabled={clampedLibraryPage === 1}>
                         <ChevronLeft size={16} />
                         Prev
@@ -3762,33 +4451,67 @@ function App() {
                   </div>
                 ) : null}
 
-                <VirtualDataGrid
-                  labels={["Select", "Name", "Type", "Size", "Date taken", "Path"]}
-                  columnSet="media"
-                  columnWidths={gridColumnWidths.media}
-                  items={gridMediaFiles}
-                  emptyMessage="No media files found yet. Add a path and start a scan."
-                  getRowKey={(item) => `${item.path}-row`}
-                  getRowClassName={(item) => (selectedFileIdSet.has(item.id) ? "selected" : "")}
-                  onRowClick={(item) => activateMediaFile(item.id)}
-                  renderCells={(item) => [
-                    <span key="select">
-                      <input
-                        type="checkbox"
-                        checked={selectedFileIdSet.has(item.id)}
-                        onChange={() => toggleFileSelection(item.id)}
-                        onClick={(event) => event.stopPropagation()}
-                        aria-label={`Select ${item.filename}`}
+                {activeSection !== "Library" || libraryTableOpen ? (
+                  <>
+                    {activeSection === "Library" ? (
+                      <div
+                        className="library-table-resize-rail"
+                        aria-label="Resize file list panel"
+                        onMouseDown={(event) => beginLibraryTableResize(event.clientY)}
                       />
-                    </span>,
-                    <span key="name">{item.filename}</span>,
-                    <span key="type">{item.extension.toUpperCase()}</span>,
-                    <span key="size">{item.fileSizeMb} MB</span>,
-                    <span key="date">{formatDate(item.dateTakenUnix)}</span>,
-                    <span key="path">{item.path}</span>
-                  ]}
-                  onBeginResize={beginGridColumnResize}
-                />
+                    ) : activeSection === "Scan" ? (
+                      <div
+                        className="scan-table-resize-rail"
+                        aria-label="Resize scan file list panel"
+                        onMouseDown={(event) => beginScanTableResize(event.clientY)}
+                      />
+                    ) : null}
+                    <div
+                      className={
+                        activeSection === "Library"
+                          ? "library-table-shell"
+                          : activeSection === "Scan"
+                            ? "scan-table-shell"
+                            : undefined
+                      }
+                      style={
+                        activeSection === "Library"
+                          ? { height: `${libraryTableHeight}px` }
+                          : activeSection === "Scan"
+                            ? { height: `${scanTableHeight}px` }
+                            : undefined
+                      }
+                    >
+                      <VirtualDataGrid
+                        labels={["Select", "Name", "Type", "Size", "Date taken", "Path"]}
+                        columnSet="media"
+                        columnWidths={gridColumnWidths.media}
+                        items={gridMediaFiles}
+                        emptyMessage="No media files found yet. Add a path and start a scan."
+                        getRowKey={(item) => `${item.path}-row`}
+                        getRowClassName={(item) => (selectedFileIdSet.has(item.id) ? "selected" : "")}
+                        onRowClick={(item) => activateMediaFile(item.id)}
+                        renderCells={(item) => [
+                          <span key="select">
+                            <input
+                              type="checkbox"
+                              checked={selectedFileIdSet.has(item.id)}
+                              onChange={() => toggleFileSelection(item.id)}
+                              onClick={(event) => event.stopPropagation()}
+                              aria-label={`Select ${item.filename}`}
+                            />
+                          </span>,
+                          <span key="name">{item.filename}</span>,
+                          <span key="type">{item.extension.toUpperCase()}</span>,
+                        <span key="size">{formatFileSize(item.fileSizeBytes)}</span>,
+                          <span key="date">{formatDate(item.dateTakenUnix)}</span>,
+                          <span key="path">{item.path}</span>
+                        ]}
+                        onBeginResize={beginGridColumnResize}
+                      />
+                    </div>
+                  </>
+                ) : null}
               </div>
               {activeSection === "Library" && detailPanelOpen ? (
                 <div
@@ -3812,9 +4535,7 @@ function App() {
                   </div>
                   {activeMediaItem ? (
                     <>
-                      <div className="detail-preview">
-                        <DetailPreview item={activeMediaItem} />
-                      </div>
+                      <LazyDetailPreview item={activeMediaItem} />
                       <div className="detail-copy">
                         <strong>{activeMediaItem.filename}</strong>
                         <span>{activeMediaItem.path}</span>
@@ -3842,7 +4563,7 @@ function App() {
                         </div>
                         <div className="detail-row">
                           <span><HardDrive size={14} /> File size</span>
-                          <strong>{activeMediaItem.fileSizeMb} MB</strong>
+                          <strong>{formatFileSize(activeMediaItem.fileSizeBytes)}</strong>
                         </div>
                         <div className="detail-row">
                           <span><Grid3X3 size={14} /> Dimensions</span>
@@ -3852,7 +4573,7 @@ function App() {
                           <span><Grid3X3 size={14} /> Megapixels</span>
                           <strong>{activeMediaItem.megapixels !== null ? `${activeMediaItem.megapixels} MP` : "Unknown"}</strong>
                         </div>
-                        {activeMediaItem.mediaType === "video" ? <VideoDetailRows item={activeMediaItem} /> : null}
+                        {activeMediaItem.mediaType === "video" ? <VideoDetailRows item={activeMediaItem} /> : <ImageDetailRows item={activeMediaItem} />}
                         <div className="detail-row">
                           <span><Clock3 size={14} /> Scanned</span>
                           <strong>{formatDate(activeMediaItem.scannedAtUnix)}</strong>
@@ -3913,7 +4634,11 @@ function App() {
             <strong>{status}</strong>
           </div>
           <div className="status-details">
-            <span>{(activeSection === "Duplicates" ? duplicateFileCount : visibleMediaFiles.length).toLocaleString()} visible</span>
+            <span>
+              {activeSection === "Duplicates"
+                ? `${duplicateFileCount.toLocaleString()} duplicate files`
+                : `${visibleMediaFiles.length.toLocaleString()} media in view`}
+            </span>
             <span>{(activeSection === "Duplicates" ? duplicateItems.length : activePreviewFiles.length).toLocaleString()} previews loaded</span>
             <span>{mediaFiles.length.toLocaleString()} cached</span>
             <span>{selectedFileIds.length.toLocaleString()} selected</span>
@@ -3945,6 +4670,46 @@ function App() {
             {selectedTagFilter ? <span>tag: {selectedTagFilter}</span> : null}
           </div>
         </footer>
+        {magnifiedMediaItem ? (
+          <div className="magnify-overlay" onClick={() => setMagnifiedMediaId(null)}>
+            <div className="magnify-dialog" onClick={(event) => event.stopPropagation()}>
+              <div className="magnify-header">
+                <div>
+                  <strong>{magnifiedMediaItem.filename}</strong>
+                  <span>{magnifiedMediaItem.path}</span>
+                </div>
+                <button onClick={() => setMagnifiedMediaId(null)}>Close</button>
+              </div>
+              <div className="detail-preview magnify-preview">
+                <DetailPreview item={magnifiedMediaItem} />
+              </div>
+            </div>
+          </div>
+        ) : null}
+        {deleteDuplicateConfirmOpen ? (
+          <div className="magnify-overlay" onClick={() => setDeleteDuplicateConfirmOpen(false)}>
+            <div className="confirm-dialog" onClick={(event) => event.stopPropagation()}>
+              <div className="confirm-dialog-header">
+                <strong>Delete selected duplicates?</strong>
+                <span>
+                  This will permanently remove the selected duplicate files from disk and mark them missing in the local scan cache.
+                </span>
+              </div>
+              <label className="duplicate-confirmation">
+                <input
+                  type="checkbox"
+                  checked={skipDeleteWarningDraft}
+                  onChange={(event) => setSkipDeleteWarningDraft(event.target.checked)}
+                />
+                <span>Do not show this warning again during this session.</span>
+              </label>
+              <div className="confirm-dialog-actions">
+                <button onClick={() => setDeleteDuplicateConfirmOpen(false)}>Cancel</button>
+                <button onClick={confirmDeleteSelectedDuplicates}>Delete</button>
+              </div>
+            </div>
+          </div>
+        ) : null}
       </section>
     </main>
   );
@@ -3998,7 +4763,15 @@ function formatFileSize(bytes: number) {
     return `${(bytes / 1_073_741_824).toFixed(1)} GB`;
   }
 
-  return `${(bytes / 1_048_576).toFixed(1)} MB`;
+  if (bytes >= 1_048_576) {
+    return `${(bytes / 1_048_576).toFixed(1)} MB`;
+  }
+
+  if (bytes >= 1024) {
+    return `${Math.max(1, Math.round(bytes / 1024)).toLocaleString()} KB`;
+  }
+
+  return `${bytes.toLocaleString()} B`;
 }
 
 function buildMoveSegments(item: MediaFile, levels: MoveLevel[]) {
@@ -4132,6 +4905,67 @@ function parseFilterNumber(value: string) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function formatScanProgressStatus(progress: ScanProgress) {
+  const parts = [
+    `${progress.stage}`,
+    `${progress.foldersVisited.toLocaleString()} folders`,
+    `${progress.totalFilesSeen.toLocaleString()} total files seen`,
+    `${progress.supportedFilesSeen.toLocaleString()} media files seen`,
+    `${progress.scannedFiles.toLocaleString()} processed`,
+    `${progress.skippedUnchanged.toLocaleString()} unchanged`
+  ];
+  if (progress.errorsCount) {
+    parts.push(`${progress.errorsCount.toLocaleString()} errors`);
+  }
+  if (progress.scanRoot) {
+    parts.push(`root: ${progress.scanRoot}`);
+  }
+  return parts.join(" | ");
+}
+
+function formatDuplicateProgressStatus(progress: DuplicateScanProgress) {
+  const parts = [
+    progress.stage,
+    `${progress.candidates.toLocaleString()} candidates`,
+    `${progress.processed.toLocaleString()} processed`,
+    `${progress.groupsFound.toLocaleString()} groups`,
+    `${progress.hashedFiles.toLocaleString()} hashed`
+  ];
+  if (progress.currentPath) {
+    parts.push(`path: ${progress.currentPath}`);
+  }
+  return parts.join(" | ");
+}
+
+function sleep(milliseconds: number) {
+  return new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+async function waitForMainThreadIdle() {
+  const requestIdle = (window as Window & {
+    requestIdleCallback?: (callback: IdleRequestCallback, options?: IdleRequestOptions) => number;
+  }).requestIdleCallback;
+
+  if (requestIdle) {
+    await new Promise<void>((resolve) => {
+      requestIdle(() => resolve(), { timeout: 180 });
+    });
+    return;
+  }
+
+  await sleep(80);
+}
+
+async function waitForNativePreviewQueueIdle() {
+  while (
+    nativeImagePreviewQueue.active > 0 ||
+    nativeImagePreviewQueue.pending.length > 0 ||
+    nativeImagePreviewInflight.size > 0
+  ) {
+    await sleep(120);
+  }
+}
+
 function normalizeDateSourceFilter(dateSource: string | null): DateSourceFilter {
   const normalized = (dateSource ?? "").trim().toLowerCase();
   if (normalized.startsWith("metadata") || normalized.startsWith("filename")) {
@@ -4146,12 +4980,252 @@ function normalizeDateSourceFilter(dateSource: string | null): DateSourceFilter 
   return normalized ? "unknown" : "unknown";
 }
 
-function PreviewImage({ item }: { item: MediaFile }) {
+function runQueuedTask<T>(queue: LimitedQueue, task: () => Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const run = () => {
+      queue.active += 1;
+      void task()
+        .then(resolve, reject)
+        .finally(() => {
+          queue.active -= 1;
+          const next = queue.pending.shift();
+          if (next) {
+            next();
+          }
+        });
+    };
+
+    if (queue.active < queue.limit) {
+      run();
+    } else {
+      queue.pending.push(run);
+    }
+  });
+}
+
+function loadVideoMetadata(path: string): Promise<VideoMetadataResult> {
+  const cached = videoMetadataCache.get(path);
+  if (cached) {
+    return Promise.resolve(cached);
+  }
+
+  const inflight = videoMetadataInflight.get(path);
+  if (inflight) {
+    return inflight;
+  }
+
+  const metadataPromise = runQueuedTask(videoMetadataQueue, () =>
+    new Promise<VideoMetadataResult>((resolve) => {
+      const video = document.createElement("video");
+      video.preload = "metadata";
+      video.muted = true;
+      video.playsInline = true;
+
+      const cleanup = () => {
+        video.pause();
+        video.removeAttribute("src");
+        video.load();
+      };
+
+      const finish = () => {
+        const metadata = {
+          durationSeconds: Number.isFinite(video.duration) ? video.duration : null,
+          width: video.videoWidth || null,
+          height: video.videoHeight || null,
+          durationLabel: null,
+          bitrateLabel: null,
+          codec: null
+        };
+        void invoke<{ durationLabel: string | null; bitrateLabel: string | null; codec: string | null }>(
+          "read_video_metadata_details",
+          { path }
+        )
+          .then((details) => ({
+            ...metadata,
+            durationLabel: details.durationLabel,
+            bitrateLabel: details.bitrateLabel,
+            codec: details.codec
+          }))
+          .catch(() => metadata)
+          .then((combined) => {
+            videoMetadataCache.set(path, combined);
+            cleanup();
+            resolve(combined);
+          });
+      };
+
+      const fail = () => {
+        const metadata = {
+          durationSeconds: null,
+          width: null,
+          height: null,
+          durationLabel: null,
+          bitrateLabel: null,
+          codec: null
+        };
+        videoMetadataCache.set(path, metadata);
+        cleanup();
+        resolve(metadata);
+      };
+
+      video.addEventListener("loadedmetadata", finish, { once: true });
+      video.addEventListener("error", fail, { once: true });
+      video.src = convertFileSrc(path);
+    })
+  );
+
+  videoMetadataInflight.set(path, metadataPromise);
+  void metadataPromise.finally(() => videoMetadataInflight.delete(path));
+  return metadataPromise;
+}
+
+function loadVideoThumbnail(path: string): Promise<string | null> {
+  if (videoThumbnailCache.has(path)) {
+    return Promise.resolve(videoThumbnailCache.get(path) ?? null);
+  }
+
+  const inflight = videoThumbnailInflight.get(path);
+  if (inflight) {
+    return inflight;
+  }
+
+  const thumbnailPromise = runQueuedTask(videoThumbnailQueue, () =>
+    new Promise<string | null>((resolve) => {
+      const video = document.createElement("video");
+      video.preload = "metadata";
+      video.muted = true;
+      video.playsInline = true;
+      video.crossOrigin = "anonymous";
+
+      const cleanup = () => {
+        video.pause();
+        video.removeAttribute("src");
+        video.load();
+      };
+
+      const fail = () => {
+        videoThumbnailCache.set(path, null);
+        cleanup();
+        resolve(null);
+      };
+
+      const captureFrame = () => {
+        const width = video.videoWidth || 320;
+        const height = video.videoHeight || 180;
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        const context = canvas.getContext("2d");
+
+        if (!context) {
+          fail();
+          return;
+        }
+
+        context.fillStyle = "#f8f7f3";
+        context.fillRect(0, 0, width, height);
+        context.drawImage(video, 0, 0, width, height);
+        const thumbnail = canvas.toDataURL("image/jpeg", 0.82);
+        videoThumbnailCache.set(path, thumbnail);
+        cleanup();
+        resolve(thumbnail);
+      };
+
+      video.addEventListener("error", fail, { once: true });
+      video.addEventListener(
+        "loadeddata",
+        () => {
+          const seekTarget = Number.isFinite(video.duration) && video.duration > 0.25 ? 0.25 : 0;
+          if (seekTarget > 0) {
+            video.addEventListener("seeked", captureFrame, { once: true });
+            try {
+              video.currentTime = seekTarget;
+            } catch {
+              captureFrame();
+            }
+          } else {
+            captureFrame();
+          }
+        },
+        { once: true }
+      );
+
+      video.src = convertFileSrc(path);
+    })
+  );
+
+  videoThumbnailInflight.set(path, thumbnailPromise);
+  void thumbnailPromise.finally(() => videoThumbnailInflight.delete(path));
+  return thumbnailPromise;
+}
+
+function canNativePreviewExtension(extension: string) {
+  return ["heic", "heif", "cr2", "nef"].includes(extension.toLowerCase());
+}
+
+function loadNativeImagePreview(path: string): Promise<string | null> {
+  if (nativeImagePreviewCache.has(path)) {
+    return Promise.resolve(nativeImagePreviewCache.get(path) ?? null);
+  }
+
+  const inflight = nativeImagePreviewInflight.get(path);
+  if (inflight) {
+    return inflight;
+  }
+
+  const previewPromise = runQueuedTask(nativeImagePreviewQueue, async () => {
+    try {
+      const previewPath = await invoke<string | null>("generate_native_image_preview", {
+        path,
+        maxDimension: 512
+      });
+      const previewSrc = previewPath ? convertFileSrc(previewPath) : null;
+      nativeImagePreviewCache.set(path, previewSrc);
+      return previewSrc;
+    } catch {
+      nativeImagePreviewCache.set(path, null);
+      return null;
+    }
+  });
+
+  nativeImagePreviewInflight.set(path, previewPromise);
+  void previewPromise.finally(() => nativeImagePreviewInflight.delete(path));
+  return previewPromise;
+}
+
+const PreviewImage = memo(function PreviewImage({ item }: { item: MediaFile }) {
   const [failed, setFailed] = useState(false);
+  const [nativePreviewSrc, setNativePreviewSrc] = useState<string | null>(null);
   const canPreview = !item.missing && canPreviewExtension(item.extension);
+  const needsNativePreview = !item.missing && canNativePreviewExtension(item.extension);
+
+  useEffect(() => {
+    let canceled = false;
+
+    if (!needsNativePreview) {
+      setNativePreviewSrc(null);
+      return;
+    }
+
+    setFailed(false);
+    setNativePreviewSrc(nativeImagePreviewCache.get(item.path) ?? null);
+    void loadNativeImagePreview(item.path).then((previewSrc) => {
+      if (!canceled) {
+        setNativePreviewSrc(previewSrc);
+      }
+    });
+
+    return () => {
+      canceled = true;
+    };
+  }, [item.path, needsNativePreview]);
 
   if (item.mediaType === "video" && canVideoPreviewExtension(item.extension)) {
     return <VideoThumbnail item={item} />;
+  }
+
+  if (needsNativePreview && nativePreviewSrc && !failed) {
+    return <img src={nativePreviewSrc} alt="" onError={() => setFailed(true)} loading="lazy" />;
   }
 
   if (!canPreview || failed) {
@@ -4159,10 +5233,33 @@ function PreviewImage({ item }: { item: MediaFile }) {
   }
 
   return <img src={convertFileSrc(item.path)} alt="" onError={() => setFailed(true)} loading="lazy" />;
-}
+});
 
-function DetailPreview({ item }: { item: MediaFile }) {
+const DetailPreview = memo(function DetailPreview({ item }: { item: MediaFile }) {
   const [failed, setFailed] = useState(false);
+  const [nativePreviewSrc, setNativePreviewSrc] = useState<string | null>(null);
+  const needsNativePreview = !item.missing && canNativePreviewExtension(item.extension);
+
+  useEffect(() => {
+    let canceled = false;
+
+    if (!needsNativePreview) {
+      setNativePreviewSrc(null);
+      return;
+    }
+
+    setFailed(false);
+    setNativePreviewSrc(nativeImagePreviewCache.get(item.path) ?? null);
+    void loadNativeImagePreview(item.path).then((previewSrc) => {
+      if (!canceled) {
+        setNativePreviewSrc(previewSrc);
+      }
+    });
+
+    return () => {
+      canceled = true;
+    };
+  }, [item.path, needsNativePreview]);
 
   if (item.missing) {
     return <FileImage size={56} />;
@@ -4172,97 +5269,107 @@ function DetailPreview({ item }: { item: MediaFile }) {
     return <video src={convertFileSrc(item.path)} controls muted preload="metadata" onError={() => setFailed(true)} />;
   }
 
+  if (needsNativePreview && nativePreviewSrc && !failed) {
+    return <img src={nativePreviewSrc} alt="" onError={() => setFailed(true)} loading="lazy" />;
+  }
+
   if (canPreviewExtension(item.extension) && !failed) {
     return <img src={convertFileSrc(item.path)} alt="" onError={() => setFailed(true)} loading="lazy" />;
   }
 
   return item.mediaType === "video" ? <Film size={56} /> : <FileImage size={56} />;
-}
+});
 
-function VideoThumbnail({ item }: { item: MediaFile }) {
+const LazyDetailPreview = memo(function LazyDetailPreview({ item }: { item: MediaFile }) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    setReady(false);
+    let canceled = false;
+    let timer: number | null = null;
+    let observer: IntersectionObserver | null = null;
+
+    const scheduleReady = () => {
+      if (timer !== null) {
+        window.clearTimeout(timer);
+      }
+      timer = window.setTimeout(() => {
+        if (!canceled) {
+          setReady(true);
+        }
+      }, 120);
+    };
+
+    const element = containerRef.current;
+    if (element && "IntersectionObserver" in window) {
+      observer = new IntersectionObserver((entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          scheduleReady();
+          observer?.disconnect();
+        }
+      });
+      observer.observe(element);
+    } else {
+      scheduleReady();
+    }
+
+    return () => {
+      canceled = true;
+      observer?.disconnect();
+      if (timer !== null) {
+        window.clearTimeout(timer);
+      }
+    };
+  }, [item.id, item.path]);
+
+  return (
+    <div className="detail-preview" ref={containerRef}>
+      {ready ? (
+        <DetailPreview item={item} />
+      ) : item.mediaType === "video" ? (
+        <div className="detail-preview-placeholder">
+          <Film size={48} />
+          <span>Loading preview...</span>
+        </div>
+      ) : (
+        <div className="detail-preview-placeholder">
+          <FileImage size={48} />
+          <span>Loading preview...</span>
+        </div>
+      )}
+    </div>
+  );
+});
+
+const VideoThumbnail = memo(function VideoThumbnail({ item }: { item: MediaFile }) {
   const [thumbnailSrc, setThumbnailSrc] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
 
   useEffect(() => {
     if (item.missing || !canVideoPreviewExtension(item.extension)) {
       setThumbnailSrc(null);
+      setFailed(false);
       return;
     }
 
     let canceled = false;
-    const video = document.createElement("video");
-    video.preload = "metadata";
-    video.muted = true;
-    video.playsInline = true;
-    video.crossOrigin = "anonymous";
+    setFailed(false);
+    setThumbnailSrc(videoThumbnailCache.get(item.path) ?? null);
+    void loadVideoThumbnail(item.path).then((thumbnail) => {
+      if (canceled) {
+        return;
+      }
 
-    const cleanup = () => {
-      video.pause();
-      video.removeAttribute("src");
-      video.load();
-    };
-
-    const handleError = () => {
-      if (!canceled) {
+      if (thumbnail) {
+        setThumbnailSrc(thumbnail);
+      } else {
         setFailed(true);
       }
-      cleanup();
-    };
-
-    const captureFrame = () => {
-      if (canceled) {
-        cleanup();
-        return;
-      }
-
-      const width = video.videoWidth || 320;
-      const height = video.videoHeight || 180;
-      const canvas = document.createElement("canvas");
-      canvas.width = width;
-      canvas.height = height;
-      const context = canvas.getContext("2d");
-
-      if (!context) {
-        handleError();
-        return;
-      }
-
-      context.fillStyle = "#f8f7f3";
-      context.fillRect(0, 0, width, height);
-      context.drawImage(video, 0, 0, width, height);
-
-      if (!canceled) {
-        setThumbnailSrc(canvas.toDataURL("image/jpeg", 0.82));
-      }
-
-      cleanup();
-    };
-
-    video.addEventListener("error", handleError, { once: true });
-    video.addEventListener(
-      "loadeddata",
-      () => {
-        const seekTarget = Number.isFinite(video.duration) && video.duration > 0.25 ? 0.25 : 0;
-        if (seekTarget > 0) {
-          const onSeeked = () => captureFrame();
-          video.addEventListener("seeked", onSeeked, { once: true });
-          try {
-            video.currentTime = seekTarget;
-          } catch {
-            captureFrame();
-          }
-        } else {
-          captureFrame();
-        }
-      },
-      { once: true }
-    );
-
-    video.src = convertFileSrc(item.path);
+    });
 
     return () => {
       canceled = true;
-      cleanup();
     };
   }, [item.extension, item.missing, item.path]);
 
@@ -4275,7 +5382,7 @@ function VideoThumbnail({ item }: { item: MediaFile }) {
   }
 
   return <div className="video-thumb-placeholder"><Film size={30} /></div>;
-}
+});
 
 function VideoDetailRows({ item }: { item: MediaFile }) {
   const metadata = useVideoMetadata(item);
@@ -4284,7 +5391,10 @@ function VideoDetailRows({ item }: { item: MediaFile }) {
     <>
       <div className="detail-row">
         <span><Film size={14} /> Duration</span>
-        <strong>{metadata.durationSeconds !== null ? formatDuration(metadata.durationSeconds) : "Loading duration..."}</strong>
+        <strong>
+          {metadata.durationLabel ??
+            (metadata.durationSeconds !== null ? formatDuration(metadata.durationSeconds) : "Loading duration...")}
+        </strong>
       </div>
       <div className="detail-row">
         <span><Grid3X3 size={14} /> Video frame</span>
@@ -4294,62 +5404,93 @@ function VideoDetailRows({ item }: { item: MediaFile }) {
             : "Loading frame size..."}
         </strong>
       </div>
+      <div className="detail-row">
+        <span><HardDrive size={14} /> Video codec</span>
+        <strong>{metadata.codec ?? "Loading codec..."}</strong>
+      </div>
+      <div className="detail-row">
+        <span><HardDrive size={14} /> Bit rate</span>
+        <strong>{metadata.bitrateLabel ?? "Loading bitrate..."}</strong>
+      </div>
+    </>
+  );
+}
+
+function ImageDetailRows({ item }: { item: MediaFile }) {
+  return (
+    <>
+      <div className="detail-row">
+        <span><HardDrive size={14} /> Camera make</span>
+        <strong>{item.cameraMake ?? "Unknown"}</strong>
+      </div>
+      <div className="detail-row">
+        <span><HardDrive size={14} /> Camera model</span>
+        <strong>{item.cameraModel ?? "Unknown"}</strong>
+      </div>
+      <div className="detail-row">
+        <span><HardDrive size={14} /> Lens</span>
+        <strong>{item.lensModel ?? "Unknown"}</strong>
+      </div>
+      <div className="detail-row">
+        <span><Grid3X3 size={14} /> Aperture</span>
+        <strong>{item.aperture ?? "Unknown"}</strong>
+      </div>
+      <div className="detail-row">
+        <span><Grid3X3 size={14} /> Focal length</span>
+        <strong>{item.focalLength ?? "Unknown"}</strong>
+      </div>
+      <div className="detail-row">
+        <span><Grid3X3 size={14} /> ISO</span>
+        <strong>{item.isoValue ?? "Unknown"}</strong>
+      </div>
     </>
   );
 }
 
 function useVideoMetadata(item: MediaFile | null) {
-  const [metadata, setMetadata] = useState<{ durationSeconds: number | null; width: number | null; height: number | null }>({
+  const [metadata, setMetadata] = useState<VideoMetadataResult>({
     durationSeconds: null,
     width: null,
-    height: null
+    height: null,
+    durationLabel: null,
+    bitrateLabel: null,
+    codec: null
   });
 
   useEffect(() => {
     if (!item || item.missing || item.mediaType !== "video" || !canVideoPreviewExtension(item.extension)) {
-      setMetadata({ durationSeconds: null, width: null, height: null });
+      setMetadata({
+        durationSeconds: null,
+        width: null,
+        height: null,
+        durationLabel: null,
+        bitrateLabel: null,
+        codec: null
+      });
       return;
     }
 
     let canceled = false;
-    const video = document.createElement("video");
-    video.preload = "metadata";
-    video.muted = true;
-    video.playsInline = true;
-
-    const cleanup = () => {
-      video.pause();
-      video.removeAttribute("src");
-      video.load();
-    };
-
-    const finish = () => {
-      if (!canceled) {
-        setMetadata({
-          durationSeconds: Number.isFinite(video.duration) ? video.duration : null,
-          width: video.videoWidth || null,
-          height: video.videoHeight || null
-        });
+    setMetadata(
+      videoMetadataCache.get(item.path) ?? {
+        durationSeconds: null,
+        width: null,
+        height: null,
+        durationLabel: null,
+        bitrateLabel: null,
+        codec: null
       }
-      cleanup();
-    };
-
-    const fail = () => {
+    );
+    void loadVideoMetadata(item.path).then((nextMetadata) => {
       if (!canceled) {
-        setMetadata({ durationSeconds: null, width: null, height: null });
+        setMetadata(nextMetadata);
       }
-      cleanup();
-    };
-
-    video.addEventListener("loadedmetadata", finish, { once: true });
-    video.addEventListener("error", fail, { once: true });
-    video.src = convertFileSrc(item.path);
+    });
 
     return () => {
       canceled = true;
-      cleanup();
     };
-  }, [item]);
+  }, [item?.extension, item?.mediaType, item?.missing, item?.path]);
 
   return metadata;
 }
