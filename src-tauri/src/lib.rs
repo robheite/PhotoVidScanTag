@@ -1,16 +1,17 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::{Read, Write},
+    io::{BufReader, Read, Write},
     path::{Path, PathBuf},
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use exif::{In, Reader as ExifReader, Tag};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 use walkdir::WalkDir;
 
 struct AppState {
@@ -77,7 +78,36 @@ struct ScanResponse {
     cached_files: usize,
     skipped_unchanged: usize,
     missing_files: usize,
+    total_files_seen: usize,
+    supported_files_seen: usize,
+    folders_visited: usize,
     errors: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ScanProgress {
+    stage: String,
+    scan_root: Option<String>,
+    current_path: Option<String>,
+    folders_visited: usize,
+    total_files_seen: usize,
+    supported_files_seen: usize,
+    files_discovered: usize,
+    scanned_files: usize,
+    skipped_unchanged: usize,
+    errors_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DuplicateScanProgress {
+    stage: String,
+    candidates: usize,
+    processed: usize,
+    groups_found: usize,
+    hashed_files: usize,
+    current_path: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -98,9 +128,27 @@ struct MediaFile {
     width: Option<i64>,
     height: Option<i64>,
     megapixels: Option<f64>,
+    camera_make: Option<String>,
+    camera_model: Option<String>,
+    lens_model: Option<String>,
+    aperture: Option<String>,
+    focal_length: Option<String>,
+    iso_value: Option<String>,
     missing: bool,
     scanned_at_unix: i64,
     tags: Vec<String>,
+}
+
+#[derive(Default)]
+struct ImageMetadataHydration {
+    date_taken_unix: Option<i64>,
+    date_source: Option<String>,
+    camera_make: Option<String>,
+    camera_model: Option<String>,
+    lens_model: Option<String>,
+    aperture: Option<String>,
+    focal_length: Option<String>,
+    iso_value: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -128,6 +176,14 @@ struct TagSummary {
     file_count: i64,
 }
 
+#[derive(Debug, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct VideoMetadataDetails {
+    duration_label: Option<String>,
+    bitrate_label: Option<String>,
+    codec: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DuplicateGroup {
@@ -142,10 +198,19 @@ struct DuplicateGroup {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DuplicateScanResponse {
+    match_mode: String,
     groups: Vec<DuplicateGroup>,
     duplicate_files: usize,
     wasted_size_bytes: i64,
     wasted_size_mb: f64,
+    hashed_files: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DuplicateHashWarmResponse {
+    candidates: usize,
+    processed: usize,
     hashed_files: usize,
 }
 
@@ -253,15 +318,38 @@ fn supported_extensions() -> Vec<String> {
     .collect()
 }
 
-#[tauri::command]
-fn scan_media(request: ScanRequest, state: State<'_, AppState>) -> Result<ScanResponse, String> {
-    let db_path = state
-        .db_path
-        .lock()
-        .map_err(|_| "Database state is unavailable".to_string())?
-        .clone();
+fn emit_scan_progress(app: &tauri::AppHandle, progress: &ScanProgress) {
+    let _ = app.emit("scan-progress", progress);
+}
+
+fn emit_duplicate_progress(app: &tauri::AppHandle, progress: &DuplicateScanProgress) {
+    let _ = app.emit("duplicate-progress", progress);
+}
+
+fn maybe_flush_scan_transaction(conn: &Connection, pending_ops: &mut usize) -> Result<(), String> {
+    if *pending_ops >= 200 {
+        conn.execute_batch("COMMIT; BEGIN IMMEDIATE TRANSACTION;")
+            .map_err(|error| error.to_string())?;
+        *pending_ops = 0;
+    }
+    Ok(())
+}
+
+fn scan_media_blocking(
+    request: ScanRequest,
+    db_path: PathBuf,
+    app: tauri::AppHandle,
+) -> Result<ScanResponse, String> {
     let conn = Connection::open(db_path).map_err(|error| error.to_string())?;
     init_db(&conn).map_err(|error| error.to_string())?;
+    let normalized_paths = request
+        .paths
+        .iter()
+        .map(|path| path.trim())
+        .filter(|path| !path.is_empty())
+        .map(String::from)
+        .collect::<Vec<_>>();
+    let mut existing_index = load_existing_media_scan_index(&conn, &normalized_paths)?;
 
     let normalized_extensions = normalize_extensions(&request.extensions);
     let started_at = unix_now();
@@ -277,17 +365,45 @@ fn scan_media(request: ScanRequest, state: State<'_, AppState>) -> Result<ScanRe
         cached_files: list_media_count(&conn).unwrap_or(0),
         skipped_unchanged: 0,
         missing_files: 0,
+        total_files_seen: 0,
+        supported_files_seen: 0,
+        folders_visited: 0,
         errors: Vec::new(),
     };
+    let mut progress = ScanProgress {
+        stage: if request.force_rescan {
+            "full scan".to_string()
+        } else {
+            "refresh scan".to_string()
+        },
+        scan_root: None,
+        current_path: None,
+        folders_visited: 0,
+        total_files_seen: 0,
+        supported_files_seen: 0,
+        files_discovered: 0,
+        scanned_files: 0,
+        skipped_unchanged: 0,
+        errors_count: 0,
+    };
+    emit_scan_progress(&app, &progress);
+    conn.execute_batch("BEGIN IMMEDIATE TRANSACTION;")
+        .map_err(|error| error.to_string())?;
+    let mut pending_ops = 0usize;
 
-    for root in request.paths.iter().map(|path| path.trim()).filter(|path| !path.is_empty()) {
+    for root in normalized_paths.iter() {
         let root_path = PathBuf::from(root);
         if !root_path.exists() {
             response.errors.push(format!("Path does not exist: {root}"));
+            progress.errors_count = response.errors.len();
             continue;
         }
 
         let root_string = root_path.to_string_lossy().to_string();
+        progress.stage = "walking folders".to_string();
+        progress.scan_root = Some(root_string.clone());
+        progress.current_path = Some(root_string.clone());
+        emit_scan_progress(&app, &progress);
         conn.execute(
             "INSERT INTO scan_roots (path, enabled, updated_at_unix)
              VALUES (?1, 1, ?2)
@@ -295,26 +411,38 @@ fn scan_media(request: ScanRequest, state: State<'_, AppState>) -> Result<ScanRe
             params![root_string, started_at],
         )
         .map_err(|error| error.to_string())?;
+        pending_ops += 1;
 
         cache_scan_folder(&conn, &root_path, &root_string, scan_run_id)
             .map_err(|error| error.to_string())?;
+        pending_ops += 1;
+        maybe_flush_scan_transaction(&conn, &mut pending_ops)?;
 
         for entry in WalkDir::new(&root_path).follow_links(false).into_iter() {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
                     response.errors.push(error.to_string());
+                    progress.errors_count = response.errors.len();
                     continue;
                 }
             };
 
             if entry.file_type().is_dir() {
+                progress.folders_visited += 1;
+                progress.current_path = Some(entry.path().to_string_lossy().to_string());
                 if let Err(error) = cache_scan_folder(&conn, entry.path(), &root_string, scan_run_id)
                 {
                     response
                         .errors
                         .push(format!("{}: {error}", entry.path().display()));
+                    progress.errors_count = response.errors.len();
                 }
+                pending_ops += 1;
+                if progress.folders_visited % 100 == 0 {
+                    emit_scan_progress(&app, &progress);
+                }
+                maybe_flush_scan_transaction(&conn, &mut pending_ops)?;
                 continue;
             }
 
@@ -322,6 +450,7 @@ fn scan_media(request: ScanRequest, state: State<'_, AppState>) -> Result<ScanRe
                 continue;
             }
 
+            progress.total_files_seen += 1;
             let path = entry.path();
             let extension = path
                 .extension()
@@ -333,8 +462,13 @@ fn scan_media(request: ScanRequest, state: State<'_, AppState>) -> Result<ScanRe
                 continue;
             }
 
+            progress.supported_files_seen += 1;
+            progress.files_discovered += 1;
+            progress.stage = "reading metadata".to_string();
+            progress.current_path = Some(path.to_string_lossy().to_string());
             match cache_media_file(
                 &conn,
+                &mut existing_index,
                 path,
                 &root_string,
                 scan_run_id,
@@ -345,8 +479,19 @@ fn scan_media(request: ScanRequest, state: State<'_, AppState>) -> Result<ScanRe
                 Ok(false) => response.skipped_unchanged += 1,
                 Err(error) => response.errors.push(format!("{}: {error}", path.display())),
             }
+            progress.scanned_files = response.scanned_files;
+            progress.skipped_unchanged = response.skipped_unchanged;
+            progress.errors_count = response.errors.len();
+            pending_ops += 1;
+            if progress.files_discovered % 200 == 0 {
+                emit_scan_progress(&app, &progress);
+            }
+            maybe_flush_scan_transaction(&conn, &mut pending_ops)?;
         }
 
+        progress.stage = "updating missing state".to_string();
+        progress.current_path = Some(root_string.clone());
+        emit_scan_progress(&app, &progress);
         conn.execute(
             "UPDATE media_files
              SET missing = 1
@@ -354,6 +499,7 @@ fn scan_media(request: ScanRequest, state: State<'_, AppState>) -> Result<ScanRe
             params![root_string, scan_run_id],
         )
         .map_err(|error| error.to_string())?;
+        pending_ops += 1;
         conn.execute(
             "UPDATE scan_folders
              SET missing = 1
@@ -361,10 +507,19 @@ fn scan_media(request: ScanRequest, state: State<'_, AppState>) -> Result<ScanRe
             params![root_string, scan_run_id],
         )
         .map_err(|error| error.to_string())?;
+        pending_ops += 1;
+        maybe_flush_scan_transaction(&conn, &mut pending_ops)?;
     }
 
+    conn.execute_batch("COMMIT;").map_err(|error| error.to_string())?;
+    progress.stage = "finalizing".to_string();
+    progress.current_path = None;
+    emit_scan_progress(&app, &progress);
     response.cached_files = list_media_count(&conn).map_err(|error| error.to_string())?;
     response.missing_files = missing_media_count(&conn).map_err(|error| error.to_string())?;
+    response.total_files_seen = progress.total_files_seen;
+    response.supported_files_seen = progress.supported_files_seen;
+    response.folders_visited = progress.folders_visited;
     let operation_type = if request.force_rescan {
         "full_scan"
     } else {
@@ -396,7 +551,29 @@ fn scan_media(request: ScanRequest, state: State<'_, AppState>) -> Result<ScanRe
     };
     record_operation(&conn, operation_type, status, &summary, details.as_deref())
         .map_err(|error| error.to_string())?;
+    progress.stage = "complete".to_string();
+    progress.scanned_files = response.scanned_files;
+    progress.skipped_unchanged = response.skipped_unchanged;
+    progress.errors_count = response.errors.len();
+    progress.current_path = None;
+    emit_scan_progress(&app, &progress);
     Ok(response)
+}
+
+#[tauri::command]
+async fn scan_media(
+    request: ScanRequest,
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<ScanResponse, String> {
+    let db_path = state
+        .db_path
+        .lock()
+        .map_err(|_| "Database state is unavailable".to_string())?
+        .clone();
+    tauri::async_runtime::spawn_blocking(move || scan_media_blocking(request, db_path, app))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -413,7 +590,8 @@ fn list_media(state: State<'_, AppState>) -> Result<Vec<MediaFile>, String> {
         .prepare(
             "SELECT id, path, scan_root, filename, extension, media_type, file_size_bytes,
                     created_unix, modified_unix, date_taken_unix, date_source,
-                    width, height, missing, scanned_at_unix
+                    width, height, camera_make, camera_model, lens_model, aperture, focal_length, iso_value,
+                    missing, scanned_at_unix
              FROM media_files
              ORDER BY missing ASC, date_taken_unix DESC, filename ASC",
         )
@@ -930,7 +1108,6 @@ fn cleanup_duplicates(
         }
 
         if !source_path.exists() {
-            mark_media_file_missing(&conn, &source_path).map_err(|error| error.to_string())?;
             response.failed_items += 1;
             response
                 .errors
@@ -1007,6 +1184,14 @@ fn cleanup_duplicates(
 
         match operation_result {
             Ok(()) => {
+                if source_path.exists() {
+                    response.failed_items += 1;
+                    response.errors.push(format!(
+                        "{}: delete/move reported success but the file still exists on disk",
+                        source_path.display()
+                    ));
+                    continue;
+                }
                 mark_media_file_missing(&conn, &source_path).map_err(|error| error.to_string())?;
             }
             Err(error) => {
@@ -1160,13 +1345,20 @@ fn save_app_settings(
     read_app_settings(&conn, &db_path)
 }
 
-#[tauri::command]
-fn find_duplicates(state: State<'_, AppState>) -> Result<DuplicateScanResponse, String> {
-    let db_path = state
-        .db_path
-        .lock()
-        .map_err(|_| "Database state is unavailable".to_string())?
-        .clone();
+fn find_duplicates_blocking(
+    db_path: PathBuf,
+    app: tauri::AppHandle,
+) -> Result<DuplicateScanResponse, String> {
+    let mut progress = DuplicateScanProgress {
+        stage: "loading candidates".to_string(),
+        candidates: 0,
+        processed: 0,
+        groups_found: 0,
+        hashed_files: 0,
+        current_path: None,
+    };
+    emit_duplicate_progress(&app, &progress);
+
     let conn = Connection::open(db_path).map_err(|error| error.to_string())?;
     init_db(&conn).map_err(|error| error.to_string())?;
 
@@ -1200,11 +1392,14 @@ fn find_duplicates(state: State<'_, AppState>) -> Result<DuplicateScanResponse, 
     let candidates = rows
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
+    progress.candidates = candidates.len();
+    progress.stage = "hashing candidates".to_string();
+    emit_duplicate_progress(&app, &progress);
 
     let mut grouped_file_ids: HashMap<(i64, String), Vec<i64>> = HashMap::new();
     let mut hashed_files = 0usize;
 
-    for (file_id, path, file_size_bytes, stored_hash) in candidates {
+    for (index, (file_id, path, file_size_bytes, stored_hash)) in candidates.into_iter().enumerate() {
         let hash = if stored_hash.is_empty() {
             let computed = compute_file_hash(Path::new(&path))
                 .map_err(|error| format!("{path}: {error}"))?;
@@ -1225,17 +1420,37 @@ fn find_duplicates(state: State<'_, AppState>) -> Result<DuplicateScanResponse, 
             .entry((file_size_bytes, hash))
             .or_default()
             .push(file_id);
+
+        progress.processed = index + 1;
+        progress.hashed_files = hashed_files;
+        progress.current_path = Some(path);
+        if progress.processed % 100 == 0 || progress.processed == progress.candidates {
+            emit_duplicate_progress(&app, &progress);
+        }
     }
 
-    let mut groups = Vec::new();
-    for ((file_size_bytes, hash), file_ids) in grouped_file_ids {
-        if file_ids.len() < 2 {
-            continue;
-        }
+    progress.stage = "loading duplicate groups".to_string();
+    progress.current_path = None;
+    emit_duplicate_progress(&app, &progress);
 
+    let grouped_candidates = grouped_file_ids
+        .into_iter()
+        .filter(|(_, file_ids)| file_ids.len() >= 2)
+        .collect::<Vec<_>>();
+
+    let duplicate_file_ids = grouped_candidates
+        .iter()
+        .flat_map(|(_, file_ids)| file_ids.iter().copied())
+        .collect::<Vec<_>>();
+    let media_by_id = query_media_files_by_ids(&conn, &duplicate_file_ids)?;
+
+    let mut groups = Vec::new();
+    for ((file_size_bytes, hash), file_ids) in grouped_candidates {
         let mut items = Vec::with_capacity(file_ids.len());
         for file_id in file_ids {
-            items.push(query_media_file(&conn, file_id)?);
+            if let Some(file) = media_by_id.get(&file_id) {
+                items.push(file.clone());
+            }
         }
 
         items.sort_by(|left, right| left.path.cmp(&right.path));
@@ -1243,6 +1458,302 @@ fn find_duplicates(state: State<'_, AppState>) -> Result<DuplicateScanResponse, 
         groups.push(DuplicateGroup {
             key: format!("{hash}:{file_size_bytes}"),
             hash,
+            file_count: items.len(),
+            wasted_size_bytes,
+            wasted_size_mb: round_mb(wasted_size_bytes),
+            items,
+        });
+        progress.groups_found = groups.len();
+        if progress.groups_found % 25 == 0 {
+            emit_duplicate_progress(&app, &progress);
+        }
+    }
+
+    groups.sort_by(|left, right| {
+        right
+            .wasted_size_bytes
+            .cmp(&left.wasted_size_bytes)
+            .then_with(|| right.file_count.cmp(&left.file_count))
+            .then_with(|| left.key.cmp(&right.key))
+    });
+
+    let duplicate_files = groups.iter().map(|group| group.file_count).sum();
+    let wasted_size_bytes = groups.iter().map(|group| group.wasted_size_bytes).sum();
+
+    let response = DuplicateScanResponse {
+        match_mode: "exact".to_string(),
+        groups,
+        duplicate_files,
+        wasted_size_bytes,
+        wasted_size_mb: round_mb(wasted_size_bytes),
+        hashed_files,
+    };
+    let summary = if response.groups.is_empty() {
+        format!("Duplicate check finished: hashed {} files, no exact duplicates found", response.hashed_files)
+    } else {
+        format!(
+            "Duplicate check finished: {} groups across {} files, {:.1} MB reclaimable",
+            response.groups.len(),
+            response.duplicate_files,
+            response.wasted_size_mb
+        )
+    };
+    record_operation(&conn, "duplicate_scan", "success", &summary, None)
+        .map_err(|error| error.to_string())?;
+    progress.stage = "complete".to_string();
+    progress.current_path = None;
+    progress.groups_found = response.groups.len();
+    progress.hashed_files = response.hashed_files;
+    emit_duplicate_progress(&app, &progress);
+    Ok(response)
+}
+
+#[derive(Clone)]
+struct ProbableDuplicateCandidate {
+    id: i64,
+    filename: String,
+    media_type: String,
+    file_size_bytes: i64,
+    date_taken_unix: Option<i64>,
+    modified_unix: Option<i64>,
+    width: Option<i64>,
+    height: Option<i64>,
+    file_hash: String,
+    probable_key: String,
+}
+
+fn normalize_probable_filename_key(filename: &str) -> String {
+    let stem = Path::new(filename)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(filename)
+        .to_lowercase();
+
+    let compact = stem
+        .chars()
+        .map(|character| if character.is_ascii_alphanumeric() { character } else { ' ' })
+        .collect::<String>();
+
+    let mut tokens = compact
+        .split_whitespace()
+        .map(|token| token.to_string())
+        .collect::<Vec<_>>();
+
+    while let Some(last) = tokens.last() {
+        if last == "copy" || last.chars().all(|character| character.is_ascii_digit()) {
+            tokens.pop();
+        } else {
+            break;
+        }
+    }
+
+    if tokens.is_empty() {
+        stem
+    } else {
+        tokens.join(" ")
+    }
+}
+
+fn probable_size_close(left: i64, right: i64) -> bool {
+    let difference = (left - right).abs();
+    let larger = left.max(right) as f64;
+    difference <= 5 * 1024 * 1024 || (difference as f64 / larger.max(1.0)) <= 0.12
+}
+
+fn probable_dates_close(left: Option<i64>, right: Option<i64>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => (left - right).abs() <= 60 * 60 * 24 * 14,
+        _ => false,
+    }
+}
+
+fn probable_dimensions_close(
+    left_width: Option<i64>,
+    left_height: Option<i64>,
+    right_width: Option<i64>,
+    right_height: Option<i64>,
+) -> bool {
+    match (left_width, left_height, right_width, right_height) {
+        (Some(left_width), Some(left_height), Some(right_width), Some(right_height)) => {
+            let left_ratio = left_width as f64 / left_height.max(1) as f64;
+            let right_ratio = right_width as f64 / right_height.max(1) as f64;
+            (left_ratio - right_ratio).abs() <= 0.03
+        }
+        _ => false,
+    }
+}
+
+fn is_probable_duplicate_match(
+    reference: &ProbableDuplicateCandidate,
+    candidate: &ProbableDuplicateCandidate,
+) -> bool {
+    if reference.media_type != candidate.media_type || reference.probable_key != candidate.probable_key {
+        return false;
+    }
+
+    let size_close = probable_size_close(reference.file_size_bytes, candidate.file_size_bytes);
+    if !size_close {
+        return false;
+    }
+
+    probable_dates_close(reference.date_taken_unix.or(reference.modified_unix), candidate.date_taken_unix.or(candidate.modified_unix))
+        || probable_dimensions_close(
+            reference.width,
+            reference.height,
+            candidate.width,
+            candidate.height,
+        )
+        || reference.filename.eq_ignore_ascii_case(&candidate.filename)
+}
+
+fn find_probable_duplicates_blocking(
+    db_path: PathBuf,
+    app: tauri::AppHandle,
+) -> Result<DuplicateScanResponse, String> {
+    let mut progress = DuplicateScanProgress {
+        stage: "loading probable candidates".to_string(),
+        candidates: 0,
+        processed: 0,
+        groups_found: 0,
+        hashed_files: 0,
+        current_path: None,
+    };
+    emit_duplicate_progress(&app, &progress);
+
+    let conn = Connection::open(db_path).map_err(|error| error.to_string())?;
+    init_db(&conn).map_err(|error| error.to_string())?;
+
+    let mut statement = conn
+        .prepare(
+            "SELECT id, filename, media_type, file_size_bytes, date_taken_unix, modified_unix, width, height, COALESCE(file_hash, '')
+             FROM media_files
+             WHERE missing = 0
+             ORDER BY filename ASC, file_size_bytes DESC",
+        )
+        .map_err(|error| error.to_string())?;
+
+    let rows = statement
+        .query_map([], |row| {
+            let filename = row.get::<_, String>(1)?;
+            Ok(ProbableDuplicateCandidate {
+                id: row.get::<_, i64>(0)?,
+                probable_key: normalize_probable_filename_key(&filename),
+                filename,
+                media_type: row.get::<_, String>(2)?,
+                file_size_bytes: row.get::<_, i64>(3)?,
+                date_taken_unix: row.get::<_, Option<i64>>(4)?,
+                modified_unix: row.get::<_, Option<i64>>(5)?,
+                width: row.get::<_, Option<i64>>(6)?,
+                height: row.get::<_, Option<i64>>(7)?,
+                file_hash: row.get::<_, String>(8)?,
+            })
+        })
+        .map_err(|error| error.to_string())?;
+
+    let candidates = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+
+    let mut grouped_by_key = HashMap::<(String, String), Vec<ProbableDuplicateCandidate>>::new();
+    for candidate in candidates {
+        if candidate.probable_key.is_empty() {
+            continue;
+        }
+        grouped_by_key
+            .entry((candidate.probable_key.clone(), candidate.media_type.clone()))
+            .or_default()
+            .push(candidate);
+    }
+
+    let candidate_buckets = grouped_by_key
+        .into_values()
+        .filter(|items| items.len() >= 2)
+        .collect::<Vec<_>>();
+
+    progress.candidates = candidate_buckets.iter().map(|items| items.len()).sum();
+    progress.stage = "grouping probable matches".to_string();
+    emit_duplicate_progress(&app, &progress);
+
+    let mut grouped_ids = Vec::<Vec<i64>>::new();
+    let mut processed = 0usize;
+
+    for bucket in candidate_buckets {
+        let mut clusters = Vec::<Vec<ProbableDuplicateCandidate>>::new();
+        for candidate in bucket {
+            processed += 1;
+            let mut matched = false;
+            for cluster in &mut clusters {
+                if let Some(reference) = cluster.first() {
+                    if is_probable_duplicate_match(reference, &candidate) {
+                        cluster.push(candidate.clone());
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+
+            if !matched {
+                clusters.push(vec![candidate.clone()]);
+            }
+
+            progress.processed = processed;
+            if progress.processed % 250 == 0 || progress.processed == progress.candidates {
+                emit_duplicate_progress(&app, &progress);
+            }
+        }
+
+        for cluster in clusters {
+            if cluster.len() < 2 {
+                continue;
+            }
+
+            let shared_hash = cluster
+                .first()
+                .map(|candidate| candidate.file_hash.clone())
+                .unwrap_or_default();
+            let is_exact_cluster = !shared_hash.is_empty()
+                && cluster
+                    .iter()
+                    .all(|candidate| !candidate.file_hash.is_empty() && candidate.file_hash == shared_hash);
+            if is_exact_cluster {
+                continue;
+            }
+
+            grouped_ids.push(cluster.into_iter().map(|candidate| candidate.id).collect());
+        }
+    }
+
+    progress.stage = "loading probable groups".to_string();
+    progress.groups_found = grouped_ids.len();
+    progress.current_path = None;
+    emit_duplicate_progress(&app, &progress);
+
+    let probable_file_ids = grouped_ids
+        .iter()
+        .flat_map(|file_ids| file_ids.iter().copied())
+        .collect::<Vec<_>>();
+    let media_by_id = query_media_files_by_ids(&conn, &probable_file_ids)?;
+
+    let mut groups = Vec::new();
+    for (group_index, file_ids) in grouped_ids.into_iter().enumerate() {
+        let mut items = file_ids
+            .into_iter()
+            .filter_map(|file_id| media_by_id.get(&file_id).cloned())
+            .collect::<Vec<_>>();
+        if items.len() < 2 {
+            continue;
+        }
+
+        items.sort_by(|left, right| left.path.cmp(&right.path));
+        let representative = items[0].filename.clone();
+        let wasted_size_bytes = items
+            .iter()
+            .skip(1)
+            .map(|item| item.file_size_bytes)
+            .sum::<i64>();
+        groups.push(DuplicateGroup {
+            key: format!("probable:{}:{}", normalize_probable_filename_key(&representative), group_index),
+            hash: format!("same-name heuristic: {}", representative),
             file_count: items.len(),
             wasted_size_bytes,
             wasted_size_mb: round_mb(wasted_size_bytes),
@@ -1262,25 +1773,165 @@ fn find_duplicates(state: State<'_, AppState>) -> Result<DuplicateScanResponse, 
     let wasted_size_bytes = groups.iter().map(|group| group.wasted_size_bytes).sum();
 
     let response = DuplicateScanResponse {
+        match_mode: "probable".to_string(),
         groups,
         duplicate_files,
         wasted_size_bytes,
         wasted_size_mb: round_mb(wasted_size_bytes),
-        hashed_files,
+        hashed_files: 0,
     };
+
     let summary = if response.groups.is_empty() {
-        format!("Duplicate check finished: hashed {} files, no exact duplicates found", response.hashed_files)
+        "Probable duplicate review finished: no likely groups found".to_string()
     } else {
         format!(
-            "Duplicate check finished: {} groups across {} files, {:.1} MB reclaimable",
+            "Probable duplicate review finished: {} groups across {} files",
             response.groups.len(),
-            response.duplicate_files,
-            response.wasted_size_mb
+            response.duplicate_files
         )
     };
-    record_operation(&conn, "duplicate_scan", "success", &summary, None)
+    record_operation(&conn, "probable_duplicate_scan", "success", &summary, None)
         .map_err(|error| error.to_string())?;
+    progress.stage = "complete".to_string();
+    progress.groups_found = response.groups.len();
+    emit_duplicate_progress(&app, &progress);
     Ok(response)
+}
+
+fn warm_duplicate_hashes_blocking(
+    db_path: PathBuf,
+    app: tauri::AppHandle,
+) -> Result<DuplicateHashWarmResponse, String> {
+    let mut progress = DuplicateScanProgress {
+        stage: "loading hash warm candidates".to_string(),
+        candidates: 0,
+        processed: 0,
+        groups_found: 0,
+        hashed_files: 0,
+        current_path: None,
+    };
+    emit_duplicate_progress(&app, &progress);
+
+    let conn = Connection::open(db_path).map_err(|error| error.to_string())?;
+    init_db(&conn).map_err(|error| error.to_string())?;
+
+    let mut statement = conn
+        .prepare(
+            "SELECT id, path
+             FROM media_files
+             WHERE missing = 0
+               AND COALESCE(file_hash, '') = ''
+               AND file_size_bytes IN (
+                 SELECT file_size_bytes
+                 FROM media_files
+                 WHERE missing = 0
+                 GROUP BY file_size_bytes
+                 HAVING COUNT(*) > 1
+               )
+             ORDER BY file_size_bytes DESC, path ASC",
+        )
+        .map_err(|error| error.to_string())?;
+
+    let rows = statement
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+        .map_err(|error| error.to_string())?;
+
+    let candidates = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+
+    progress.candidates = candidates.len();
+    progress.stage = "warming duplicate hashes".to_string();
+    emit_duplicate_progress(&app, &progress);
+
+    let mut hashed_files = 0usize;
+    for (index, (file_id, path)) in candidates.into_iter().enumerate() {
+        let computed = compute_file_hash(Path::new(&path)).map_err(|error| format!("{path}: {error}"))?;
+        conn.execute(
+            "UPDATE media_files
+             SET file_hash = ?1, hash_updated_at_unix = ?2
+             WHERE id = ?3",
+            params![computed, unix_now(), file_id],
+        )
+        .map_err(|error| error.to_string())?;
+
+        hashed_files += 1;
+        progress.processed = index + 1;
+        progress.hashed_files = hashed_files;
+        progress.current_path = Some(path);
+        if progress.processed % 100 == 0 || progress.processed == progress.candidates {
+            emit_duplicate_progress(&app, &progress);
+        }
+    }
+
+    let response = DuplicateHashWarmResponse {
+        candidates: progress.candidates,
+        processed: progress.processed,
+        hashed_files,
+    };
+
+    let summary = if response.candidates == 0 {
+        "Duplicate hash warm-up found no pending candidates".to_string()
+    } else {
+        format!(
+            "Duplicate hash warm-up finished: {} hashed across {} candidate files",
+            response.hashed_files, response.candidates
+        )
+    };
+    record_operation(&conn, "duplicate_hash_warm", "success", &summary, None)
+        .map_err(|error| error.to_string())?;
+
+    progress.stage = "complete".to_string();
+    progress.current_path = None;
+    progress.hashed_files = response.hashed_files;
+    emit_duplicate_progress(&app, &progress);
+
+    Ok(response)
+}
+
+#[tauri::command]
+async fn find_duplicates(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<DuplicateScanResponse, String> {
+    let db_path = state
+        .db_path
+        .lock()
+        .map_err(|_| "Database state is unavailable".to_string())?
+        .clone();
+    tauri::async_runtime::spawn_blocking(move || find_duplicates_blocking(db_path, app))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn find_probable_duplicates(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<DuplicateScanResponse, String> {
+    let db_path = state
+        .db_path
+        .lock()
+        .map_err(|_| "Database state is unavailable".to_string())?
+        .clone();
+    tauri::async_runtime::spawn_blocking(move || find_probable_duplicates_blocking(db_path, app))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn warm_duplicate_hashes(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<DuplicateHashWarmResponse, String> {
+    let db_path = state
+        .db_path
+        .lock()
+        .map_err(|_| "Database state is unavailable".to_string())?
+        .clone();
+    tauri::async_runtime::spawn_blocking(move || warm_duplicate_hashes_blocking(db_path, app))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -1400,6 +2051,91 @@ fn list_scan_folders(state: State<'_, AppState>) -> Result<Vec<ScanFolder>, Stri
         .map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+fn remove_scan_root(path: String, state: State<'_, AppState>) -> Result<(), String> {
+    let db_path = state
+        .db_path
+        .lock()
+        .map_err(|_| "Database state is unavailable".to_string())?
+        .clone();
+    let conn = Connection::open(&db_path).map_err(|error| error.to_string())?;
+    init_db(&conn).map_err(|error| error.to_string())?;
+
+    conn.execute_batch("BEGIN IMMEDIATE TRANSACTION;")
+        .map_err(|error| error.to_string())?;
+
+    let result = (|| -> Result<(), String> {
+        conn.execute("DELETE FROM media_files WHERE scan_root = ?1", params![path.as_str()])
+            .map_err(|error| error.to_string())?;
+        conn.execute("DELETE FROM scan_folders WHERE scan_root = ?1", params![path.as_str()])
+            .map_err(|error| error.to_string())?;
+        conn.execute("DELETE FROM scan_roots WHERE path = ?1", params![path.as_str()])
+            .map_err(|error| error.to_string())?;
+
+        let summary = format!("Removed scan root {path} from saved library");
+        record_operation(&conn, "remove_scan_root", "success", &summary, None)
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch("COMMIT;")
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(error)
+        }
+    }
+}
+
+#[tauri::command]
+async fn hydrate_media_dimensions(
+    file_id: i64,
+    state: State<'_, AppState>,
+) -> Result<MediaFile, String> {
+    let db_path = state
+        .db_path
+        .lock()
+        .map_err(|_| "Database state is unavailable".to_string())?
+        .clone();
+
+    tauri::async_runtime::spawn_blocking(move || hydrate_media_dimensions_blocking(file_id, db_path))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn generate_native_image_preview(
+    path: String,
+    max_dimension: Option<u32>,
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    let db_path = state
+        .db_path
+        .lock()
+        .map_err(|_| "Database state is unavailable".to_string())?
+        .clone();
+    let preview_path = PathBuf::from(path);
+    let dimension = max_dimension.unwrap_or(512).clamp(128, 2048);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        build_native_image_preview(&preview_path, &db_path, dimension)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn read_video_metadata_details(path: String) -> Result<VideoMetadataDetails, String> {
+    let video_path = PathBuf::from(path);
+    tauri::async_runtime::spawn_blocking(move || read_native_video_metadata(&video_path))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
 fn read_app_settings(conn: &Connection, db_path: &Path) -> Result<AppSettings, String> {
     let selected_extensions = get_setting_value(conn, "selected_extensions")
         .map_err(|error| error.to_string())?
@@ -1502,6 +2238,12 @@ fn init_db(conn: &Connection) -> rusqlite::Result<()> {
             date_source TEXT,
             width INTEGER,
             height INTEGER,
+            camera_make TEXT,
+            camera_model TEXT,
+            lens_model TEXT,
+            aperture TEXT,
+            focal_length TEXT,
+            iso_value TEXT,
             missing INTEGER NOT NULL DEFAULT 0,
             last_seen_scan_id INTEGER NOT NULL,
             scanned_at_unix INTEGER NOT NULL
@@ -1543,6 +2285,12 @@ fn init_db(conn: &Connection) -> rusqlite::Result<()> {
 
     ensure_column(conn, "media_files", "file_hash", "TEXT")?;
     ensure_column(conn, "media_files", "hash_updated_at_unix", "INTEGER")?;
+    ensure_column(conn, "media_files", "camera_make", "TEXT")?;
+    ensure_column(conn, "media_files", "camera_model", "TEXT")?;
+    ensure_column(conn, "media_files", "lens_model", "TEXT")?;
+    ensure_column(conn, "media_files", "aperture", "TEXT")?;
+    ensure_column(conn, "media_files", "focal_length", "TEXT")?;
+    ensure_column(conn, "media_files", "iso_value", "TEXT")?;
     Ok(())
 }
 
@@ -1754,7 +2502,8 @@ fn query_media_file(conn: &Connection, file_id: i64) -> Result<MediaFile, String
         .prepare(
             "SELECT id, path, scan_root, filename, extension, media_type, file_size_bytes,
                     created_unix, modified_unix, date_taken_unix, date_source,
-                    width, height, missing, scanned_at_unix
+                    width, height, camera_make, camera_model, lens_model, aperture, focal_length, iso_value,
+                    missing, scanned_at_unix
              FROM media_files
              WHERE id = ?1",
         )
@@ -1767,8 +2516,414 @@ fn query_media_file(conn: &Connection, file_id: i64) -> Result<MediaFile, String
     Ok(file)
 }
 
+fn query_media_files_by_ids(conn: &Connection, file_ids: &[i64]) -> Result<HashMap<i64, MediaFile>, String> {
+    if file_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let tags_by_file = query_tags_by_file(conn)?;
+    let mut files_by_id = HashMap::<i64, MediaFile>::new();
+
+    for chunk in file_ids.chunks(400) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql = format!(
+            "SELECT id, path, scan_root, filename, extension, media_type, file_size_bytes,
+                    created_unix, modified_unix, date_taken_unix, date_source,
+                    width, height, camera_make, camera_model, lens_model, aperture, focal_length, iso_value,
+                    missing, scanned_at_unix
+             FROM media_files
+             WHERE id IN ({placeholders})"
+        );
+
+        let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(chunk.iter()), |row| map_media_row(row))
+            .map_err(|error| error.to_string())?;
+
+        for row in rows {
+            let mut file = row.map_err(|error| error.to_string())?;
+            file.tags = tags_by_file.get(&file.id).cloned().unwrap_or_default();
+            files_by_id.insert(file.id, file);
+        }
+    }
+
+    Ok(files_by_id)
+}
+
+fn read_image_dimensions(path: &Path) -> (Option<i64>, Option<i64>) {
+    image::image_dimensions(path)
+        .map(|(width, height)| (Some(width as i64), Some(height as i64)))
+        .unwrap_or((None, None))
+}
+
+fn clean_metadata_text(value: Option<String>) -> Option<String> {
+    value
+        .map(|text| text.trim().trim_matches(char::from(0)).to_string())
+        .filter(|text| !text.is_empty())
+}
+
+fn exif_field_text(exif: &exif::Exif, tag: Tag) -> Option<String> {
+    clean_metadata_text(
+        exif.get_field(tag, In::PRIMARY)
+            .map(|field| field.display_value().with_unit(exif).to_string()),
+    )
+}
+
+fn parse_exif_timestamp(value: &str) -> Option<i64> {
+    let candidate = value.trim();
+    if candidate.len() < 19 {
+        return None;
+    }
+
+    let year = candidate[0..4].parse::<i32>().ok()?;
+    let month = candidate[5..7].parse::<u32>().ok()?;
+    let day = candidate[8..10].parse::<u32>().ok()?;
+    let hour = candidate[11..13].parse::<u32>().ok()?;
+    let minute = candidate[14..16].parse::<u32>().ok()?;
+    let second = candidate[17..19].parse::<u32>().ok()?;
+
+    if !(1900..=2100).contains(&year)
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+
+    let days = days_from_civil(year, month, day)?;
+    Some(days * 86_400 + hour as i64 * 3_600 + minute as i64 * 60 + second as i64)
+}
+
+fn read_image_metadata(path: &Path) -> ImageMetadataHydration {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return ImageMetadataHydration::default(),
+    };
+
+    let mut reader = BufReader::new(file);
+    let exif = match ExifReader::new().read_from_container(&mut reader) {
+        Ok(exif) => exif,
+        Err(_) => return ImageMetadataHydration::default(),
+    };
+
+    let date_taken = exif_field_text(&exif, Tag::DateTimeOriginal)
+        .or_else(|| exif_field_text(&exif, Tag::DateTimeDigitized))
+        .or_else(|| exif_field_text(&exif, Tag::DateTime));
+
+    ImageMetadataHydration {
+        date_taken_unix: date_taken.as_deref().and_then(parse_exif_timestamp),
+        date_source: date_taken.as_ref().map(|_| "EXIF metadata".to_string()),
+        camera_make: exif_field_text(&exif, Tag::Make),
+        camera_model: exif_field_text(&exif, Tag::Model),
+        lens_model: exif_field_text(&exif, Tag::LensModel),
+        aperture: exif_field_text(&exif, Tag::FNumber),
+        focal_length: exif_field_text(&exif, Tag::FocalLength),
+        iso_value: exif_field_text(&exif, Tag::PhotographicSensitivity)
+            .or_else(|| exif_field_text(&exif, Tag::ISOSpeed)),
+    }
+}
+
+fn preview_cache_dir(db_path: &Path) -> PathBuf {
+    db_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("preview-cache")
+}
+
+fn native_preview_cache_path(db_path: &Path, path: &Path, max_dimension: u32) -> Result<PathBuf, String> {
+    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(system_time_to_unix)
+        .unwrap_or_default();
+    let size = metadata.len();
+    let mut hasher = Sha256::new();
+    hasher.update(path.to_string_lossy().as_bytes());
+    hasher.update(modified.to_le_bytes());
+    hasher.update(size.to_le_bytes());
+    hasher.update(max_dimension.to_le_bytes());
+    let key = format!("{:x}", hasher.finalize());
+    Ok(preview_cache_dir(db_path).join(format!("{key}.jpg")))
+}
+
+#[cfg(target_os = "windows")]
+fn generate_native_image_preview_file(
+    input_path: &Path,
+    output_path: &Path,
+    max_dimension: u32,
+) -> Result<(), String> {
+    let script = r#"
+Add-Type -AssemblyName PresentationCore
+$inputPath = $env:MEDIATAGGER_INPUT_PATH
+$outputPath = $env:MEDIATAGGER_OUTPUT_PATH
+$maxDim = [int]$env:MEDIATAGGER_MAX_DIM
+$uri = [System.Uri]::new($inputPath)
+$frame = [System.Windows.Media.Imaging.BitmapFrame]::Create(
+  $uri,
+  [System.Windows.Media.Imaging.BitmapCreateOptions]::IgnoreColorProfile,
+  [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+)
+$scale = [Math]::Min(1.0, $maxDim / [double][Math]::Max($frame.PixelWidth, $frame.PixelHeight))
+if ($scale -lt 1.0) {
+  $bitmap = New-Object System.Windows.Media.Imaging.TransformedBitmap(
+    $frame,
+    (New-Object System.Windows.Media.ScaleTransform($scale, $scale))
+  )
+} else {
+  $bitmap = $frame
+}
+$encoder = New-Object System.Windows.Media.Imaging.JpegBitmapEncoder
+$encoder.QualityLevel = 82
+$encoder.Frames.Add([System.Windows.Media.Imaging.BitmapFrame]::Create($bitmap))
+$stream = [System.IO.File]::Open($outputPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
+try {
+  $encoder.Save($stream)
+} finally {
+  $stream.Dispose()
+}
+"#;
+
+    let status = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .env("MEDIATAGGER_INPUT_PATH", input_path)
+        .env("MEDIATAGGER_OUTPUT_PATH", output_path)
+        .env("MEDIATAGGER_MAX_DIM", max_dimension.to_string())
+        .status()
+        .map_err(|error| error.to_string())?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Windows native image preview conversion failed with status {status}"
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn generate_native_image_preview_file(
+    input_path: &Path,
+    output_path: &Path,
+    max_dimension: u32,
+) -> Result<(), String> {
+    let status = std::process::Command::new("sips")
+        .args([
+            "-s",
+            "format",
+            "jpeg",
+            "-Z",
+            &max_dimension.to_string(),
+        ])
+        .arg(input_path)
+        .args(["--out"])
+        .arg(output_path)
+        .status()
+        .map_err(|error| error.to_string())?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "macOS native image preview conversion failed with status {status}"
+        ))
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn generate_native_image_preview_file(
+    _input_path: &Path,
+    _output_path: &Path,
+    _max_dimension: u32,
+) -> Result<(), String> {
+    Err("Native image preview generation is not supported on this platform".to_string())
+}
+
+fn build_native_image_preview(
+    path: &Path,
+    db_path: &Path,
+    max_dimension: u32,
+) -> Result<Option<String>, String> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    if !matches!(extension.as_str(), "heic" | "heif" | "cr2" | "nef") {
+        return Ok(None);
+    }
+
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let cache_path = native_preview_cache_path(db_path, path, max_dimension)?;
+    if cache_path.exists() {
+        return Ok(Some(cache_path.to_string_lossy().to_string()));
+    }
+
+    fs::create_dir_all(preview_cache_dir(db_path)).map_err(|error| error.to_string())?;
+    generate_native_image_preview_file(path, &cache_path, max_dimension)?;
+    Ok(Some(cache_path.to_string_lossy().to_string()))
+}
+
+#[cfg(target_os = "windows")]
+fn read_native_video_metadata(path: &Path) -> Result<VideoMetadataDetails, String> {
+    let script = r#"
+Add-Type -AssemblyName System.Web.Extensions
+$path = $env:MEDIATAGGER_VIDEO_PATH
+$folderPath = Split-Path -Path $path -Parent
+$fileName = Split-Path -Path $path -Leaf
+$shell = New-Object -ComObject Shell.Application
+$folder = $shell.Namespace($folderPath)
+if (-not $folder) { throw "Unable to open folder metadata namespace." }
+$item = $folder.ParseName($fileName)
+if (-not $item) { throw "Unable to resolve file metadata item." }
+$props = @{}
+0..320 | ForEach-Object {
+  $name = $folder.GetDetailsOf($null, $_)
+  if ($name) {
+    $value = $folder.GetDetailsOf($item, $_)
+    if ($value) { $props[$name] = $value }
+  }
+}
+$result = [ordered]@{
+  durationLabel = $props['Length']
+  bitrateLabel = $props['Bit rate']
+  codec = $props['Video compression']
+}
+[System.Web.Script.Serialization.JavaScriptSerializer]::new().Serialize($result)
+"#;
+
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .env("MEDIATAGGER_VIDEO_PATH", path)
+        .output()
+        .map_err(|error| error.to_string())?;
+
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if raw.is_empty() {
+        return Ok(VideoMetadataDetails::default());
+    }
+
+    let mut details =
+        serde_json::from_str::<VideoMetadataDetails>(&raw).map_err(|error| error.to_string())?;
+    details.codec = details.codec.and_then(normalize_windows_video_codec);
+    Ok(details)
+}
+
+#[cfg(target_os = "macos")]
+fn read_native_video_metadata(path: &Path) -> Result<VideoMetadataDetails, String> {
+    let output = std::process::Command::new("mdls")
+        .args([
+            "-name",
+            "kMDItemDurationSeconds",
+            "-name",
+            "kMDItemCodecs",
+            "-name",
+            "kMDItemTotalBitRate",
+        ])
+        .arg(path)
+        .output()
+        .map_err(|error| error.to_string())?;
+
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut details = VideoMetadataDetails::default();
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if let Some(value) = trimmed.strip_prefix("kMDItemDurationSeconds = ") {
+            details.duration_label = Some(value.trim_matches('"').to_string());
+        } else if let Some(value) = trimmed.strip_prefix("kMDItemTotalBitRate = ") {
+            details.bitrate_label = Some(value.trim_matches('"').to_string());
+        } else if let Some(value) = trimmed.strip_prefix("kMDItemCodecs = ") {
+            details.codec = Some(value.trim_matches('"').to_string());
+        }
+    }
+    Ok(details)
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn read_native_video_metadata(_path: &Path) -> Result<VideoMetadataDetails, String> {
+    Ok(VideoMetadataDetails::default())
+}
+
+fn normalize_windows_video_codec(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(hex) = trimmed
+        .strip_prefix('{')
+        .and_then(|value| value.strip_suffix('}'))
+        .and_then(|value| value.split('-').next())
+    {
+        if hex.len() == 8 {
+            let bytes = (0..4)
+                .filter_map(|index| u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).ok())
+                .collect::<Vec<_>>();
+            if bytes.len() == 4 {
+                let reversed = bytes.into_iter().rev().collect::<Vec<_>>();
+                if reversed.iter().all(|byte| byte.is_ascii_graphic()) {
+                    return Some(String::from_utf8_lossy(&reversed).to_string());
+                }
+            }
+        }
+    }
+
+    Some(trimmed.to_string())
+}
+
+fn load_existing_media_scan_index(
+    conn: &Connection,
+    roots: &[String],
+) -> Result<HashMap<String, (i64, Option<i64>)>, String> {
+    let mut index = HashMap::new();
+
+    if roots.is_empty() {
+        return Ok(index);
+    }
+
+    let placeholders = vec!["?"; roots.len()].join(", ");
+    let sql = format!(
+        "SELECT path, file_size_bytes, modified_unix
+         FROM media_files
+         WHERE scan_root IN ({placeholders})"
+    );
+    let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
+    let params = rusqlite::params_from_iter(roots.iter());
+    let rows = statement
+        .query_map(params, |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+
+    for row in rows {
+        let (path, file_size_bytes, modified_unix) = row.map_err(|error| error.to_string())?;
+        index.insert(path, (file_size_bytes, modified_unix));
+    }
+
+    Ok(index)
+}
+
 fn cache_media_file(
     conn: &Connection,
+    existing_index: &mut HashMap<String, (i64, Option<i64>)>,
     path: &Path,
     scan_root: &str,
     scan_run_id: i64,
@@ -1783,13 +2938,7 @@ fn cache_media_file(
     let path_string = path.to_string_lossy().to_string();
     let file_size_bytes = metadata.len() as i64;
     let modified_unix = metadata.modified().ok().and_then(system_time_to_unix);
-    let existing = conn
-        .query_row(
-            "SELECT file_size_bytes, modified_unix FROM media_files WHERE path = ?1",
-            params![path_string],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
-        )
-        .optional()?;
+    let existing = existing_index.get(&path_string).copied();
 
     if !force_rescan && existing == Some((file_size_bytes, modified_unix)) {
         conn.execute(
@@ -1820,17 +2969,22 @@ fn cache_media_file(
     } else {
         (modified_unix, Some("filesystem modified".to_string()))
     };
-    let (width, height) = image::image_dimensions(path)
-        .map(|(width, height)| (Some(width as i64), Some(height as i64)))
-        .unwrap_or((None, None));
+    let (width, height): (Option<i64>, Option<i64>) = (None, None);
+    let camera_make: Option<String> = None;
+    let camera_model: Option<String> = None;
+    let lens_model: Option<String> = None;
+    let aperture: Option<String> = None;
+    let focal_length: Option<String> = None;
+    let iso_value: Option<String> = None;
 
     conn.execute(
         "INSERT INTO media_files (
             path, scan_root, filename, extension, media_type, file_size_bytes,
             created_unix, modified_unix, date_taken_unix, date_source,
-            width, height, missing, last_seen_scan_id, scanned_at_unix, file_hash, hash_updated_at_unix
+            width, height, camera_make, camera_model, lens_model, aperture, focal_length, iso_value,
+            missing, last_seen_scan_id, scanned_at_unix, file_hash, hash_updated_at_unix
          )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0, ?13, ?14, NULL, NULL)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, 0, ?19, ?20, NULL, NULL)
          ON CONFLICT(path) DO UPDATE SET
             scan_root = excluded.scan_root,
             filename = excluded.filename,
@@ -1841,10 +2995,26 @@ fn cache_media_file(
             modified_unix = excluded.modified_unix,
             date_taken_unix = excluded.date_taken_unix,
             date_source = excluded.date_source,
-            width = excluded.width,
-            height = excluded.height,
-            file_hash = NULL,
-            hash_updated_at_unix = NULL,
+            width = COALESCE(excluded.width, media_files.width),
+            height = COALESCE(excluded.height, media_files.height),
+            camera_make = COALESCE(excluded.camera_make, media_files.camera_make),
+            camera_model = COALESCE(excluded.camera_model, media_files.camera_model),
+            lens_model = COALESCE(excluded.lens_model, media_files.lens_model),
+            aperture = COALESCE(excluded.aperture, media_files.aperture),
+            focal_length = COALESCE(excluded.focal_length, media_files.focal_length),
+            iso_value = COALESCE(excluded.iso_value, media_files.iso_value),
+            file_hash = CASE
+                WHEN excluded.file_size_bytes = media_files.file_size_bytes
+                 AND COALESCE(excluded.modified_unix, -1) = COALESCE(media_files.modified_unix, -1)
+                THEN media_files.file_hash
+                ELSE NULL
+            END,
+            hash_updated_at_unix = CASE
+                WHEN excluded.file_size_bytes = media_files.file_size_bytes
+                 AND COALESCE(excluded.modified_unix, -1) = COALESCE(media_files.modified_unix, -1)
+                THEN media_files.hash_updated_at_unix
+                ELSE NULL
+            END,
             missing = 0,
             last_seen_scan_id = excluded.last_seen_scan_id,
             scanned_at_unix = excluded.scanned_at_unix",
@@ -1861,12 +3031,102 @@ fn cache_media_file(
             date_source,
             width,
             height,
+            camera_make,
+            camera_model,
+            lens_model,
+            aperture,
+            focal_length,
+            iso_value,
             scan_run_id,
             scanned_at
         ],
     )?;
+    existing_index.insert(path_string, (file_size_bytes, modified_unix));
 
     Ok(true)
+}
+
+fn hydrate_media_dimensions_blocking(
+    file_id: i64,
+    db_path: PathBuf,
+) -> Result<MediaFile, String> {
+    let conn = Connection::open(db_path).map_err(|error| error.to_string())?;
+    init_db(&conn).map_err(|error| error.to_string())?;
+    let mut file = query_media_file(&conn, file_id)?;
+
+    if file.missing {
+        return Ok(file);
+    }
+
+    let path = PathBuf::from(&file.path);
+    if !path.exists() {
+        return Ok(file);
+    }
+
+    let mut metadata = ImageMetadataHydration::default();
+    if file.media_type != "video" {
+        metadata = read_image_metadata(&path);
+    }
+    let (width, height) = if file.media_type == "video" {
+        (file.width, file.height)
+    } else {
+        read_image_dimensions(&path)
+    };
+
+    if width.is_some()
+        || height.is_some()
+        || metadata.date_taken_unix.is_some()
+        || metadata.camera_make.is_some()
+        || metadata.camera_model.is_some()
+        || metadata.lens_model.is_some()
+        || metadata.aperture.is_some()
+        || metadata.focal_length.is_some()
+        || metadata.iso_value.is_some()
+    {
+        conn.execute(
+            "UPDATE media_files
+             SET width = COALESCE(?2, width),
+                 height = COALESCE(?3, height),
+                 date_taken_unix = COALESCE(?4, date_taken_unix),
+                 date_source = COALESCE(?5, date_source),
+                 camera_make = COALESCE(?6, camera_make),
+                 camera_model = COALESCE(?7, camera_model),
+                 lens_model = COALESCE(?8, lens_model),
+                 aperture = COALESCE(?9, aperture),
+                 focal_length = COALESCE(?10, focal_length),
+                 iso_value = COALESCE(?11, iso_value)
+             WHERE id = ?1",
+            params![
+                file_id,
+                width,
+                height,
+                metadata.date_taken_unix,
+                metadata.date_source,
+                metadata.camera_make,
+                metadata.camera_model,
+                metadata.lens_model,
+                metadata.aperture,
+                metadata.focal_length,
+                metadata.iso_value
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        file.width = width.or(file.width);
+        file.height = height.or(file.height);
+        file.date_taken_unix = metadata.date_taken_unix.or(file.date_taken_unix);
+        file.date_source = metadata.date_source.or(file.date_source);
+        file.camera_make = metadata.camera_make.or(file.camera_make);
+        file.camera_model = metadata.camera_model.or(file.camera_model);
+        file.lens_model = metadata.lens_model.or(file.lens_model);
+        file.aperture = metadata.aperture.or(file.aperture);
+        file.focal_length = metadata.focal_length.or(file.focal_length);
+        file.iso_value = metadata.iso_value.or(file.iso_value);
+        file.megapixels = file.width
+            .zip(file.height)
+            .map(|(w, h)| ((w * h) as f64 / 1_000_000.0 * 10.0).round() / 10.0);
+    }
+
+    Ok(file)
 }
 
 fn normalize_extensions(extensions: &[String]) -> HashSet<String> {
@@ -1940,8 +3200,14 @@ fn map_media_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaFile> {
         width,
         height,
         megapixels,
-        missing: row.get::<_, i64>(13)? == 1,
-        scanned_at_unix: row.get(14)?,
+        camera_make: row.get(13)?,
+        camera_model: row.get(14)?,
+        lens_model: row.get(15)?,
+        aperture: row.get(16)?,
+        focal_length: row.get(17)?,
+        iso_value: row.get(18)?,
+        missing: row.get::<_, i64>(19)? == 1,
+        scanned_at_unix: row.get(20)?,
         tags: Vec::new(),
     })
 }
@@ -2187,6 +3453,9 @@ pub fn run() {
             health_check,
             supported_extensions,
             scan_media,
+            hydrate_media_dimensions,
+            generate_native_image_preview,
+            read_video_metadata_details,
             open_file_path,
             open_file_location,
             save_text_report,
@@ -2195,11 +3464,14 @@ pub fn run() {
             save_app_settings,
             list_media,
             list_scan_roots,
+            remove_scan_root,
             list_scan_folders,
             list_tags,
             apply_tags,
             remove_tag_from_files,
             find_duplicates,
+            find_probable_duplicates,
+            warm_duplicate_hashes,
             list_operation_history,
             clear_operation_history,
             cleanup_duplicates

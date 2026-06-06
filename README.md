@@ -46,3 +46,24 @@ cmd /c tools\tauri-build-windows.cmd
 ```
 
 The Windows helper loads the Visual Studio C++ build environment, adds Cargo to `PATH`, then runs the Tauri build. This is needed when building from a normal shell instead of a Visual Studio Developer Command Prompt.
+
+macOS desktop build, on a Mac:
+
+```bash
+npm run tauri:build:macos:unsigned
+```
+
+or, once Apple signing/notarization is configured on the Mac:
+
+```bash
+npm run tauri:build:macos
+```
+
+See [MAC_BUILD.md](/I:/PhotoVidScanTag/MAC_BUILD.md) for the dedicated macOS branch workflow and release checklist.
+
+For GitHub-hosted unsigned macOS test builds, use the `macOS Build` workflow on the `MAC` branch and download the `MediaTagger-macos-bundle` artifact from the workflow run. Prefer the zipped `.app` bundle from the artifact, then on the Mac run:
+
+```bash
+xattr -dr com.apple.quarantine "MediaTagger.app"
+open "MediaTagger.app"
+```
