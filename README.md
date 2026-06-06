@@ -61,9 +61,30 @@ npm run tauri:build:macos
 
 See [MAC_BUILD.md](/I:/PhotoVidScanTag/MAC_BUILD.md) for the dedicated macOS branch workflow and release checklist.
 
-For GitHub-hosted unsigned macOS test builds, use the `macOS Build` workflow on the `MAC` branch and download the `MediaTagger-macos-app` artifact from the workflow run. Use the zipped `.app` bundle from the artifact, then on the Mac run:
+## macOS test install from GitHub
+
+Use these exact steps for an unsigned Mac test build:
+
+1. Open the repo on GitHub.
+2. Click **Actions**.
+3. Click **macOS Build**.
+4. Open the newest successful run for branch `MAC`.
+5. Scroll to **Artifacts**.
+6. Click **MediaTagger-macos-app** to download it.
+7. Move the downloaded zip to the Mac.
+8. Double-click the zip so it extracts `MediaTagger.app`.
+9. Open **Terminal** on the Mac.
+10. Change into the folder containing `MediaTagger.app`.
+11. Run:
 
 ```bash
 xattr -dr com.apple.quarantine "MediaTagger.app"
 open "MediaTagger.app"
 ```
+
+12. If macOS still warns, right-click `MediaTagger.app` in Finder and choose **Open** once.
+
+Important:
+- Do **not** use the GitHub release auto-generated `Source code (zip)` file for testing the Mac app.
+- Do **not** use the unsigned DMG from older runs.
+- For unsigned GitHub test builds, use the `MediaTagger-macos-app` artifact zip only.
