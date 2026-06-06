@@ -73,6 +73,50 @@ open "src-tauri/target/release/bundle/macos/MediaTagger.app"
 npm run tauri:build:macos
 ```
 
+## Exact local build steps from a downloaded source zip
+
+If you download the source onto the Mac and want to build it there manually, use this exact sequence:
+
+1. Download the source zip to the Mac.
+2. Double-click the zip in Finder so it extracts the project folder.
+3. Open **Terminal**:
+   - press `Command + Space`
+   - type `Terminal`
+   - press `Return`
+4. In Terminal, change into the extracted project folder.
+5. Change into the `tools` folder:
+
+```bash
+cd tools
+```
+
+6. Make the build helper executable:
+
+```bash
+chmod +x tauri-build-macos.sh
+```
+
+7. Run the helper:
+
+```bash
+./tauri-build-macos.sh
+```
+
+8. Wait for the build to finish.
+9. Open the generated bundle output under:
+
+```text
+src-tauri/target/release/bundle
+```
+
+10. Launch `MediaTagger.app`.
+11. If macOS blocks it on first run, run:
+
+```bash
+xattr -dr com.apple.quarantine "MediaTagger.app"
+open "MediaTagger.app"
+```
+
 ## GitHub Actions path
 
 If you want the easiest first test without touching local Mac build tooling, use the GitHub Actions workflow on the `MAC` branch:
