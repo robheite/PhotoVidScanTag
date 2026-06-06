@@ -30,7 +30,7 @@ jobs:
       - name: Install frontend dependencies
         run: npm install
 
-      - name: Build unsigned macOS bundle
+      - name: Build unsigned macOS app bundle
         run: npm run tauri:build:macos:unsigned
 
       - name: Package app bundle for download
@@ -50,7 +50,9 @@ jobs:
           {
             echo "## Unsigned macOS test build"
             echo
-            echo "Artifacts include the raw \`.app\`, any generated \`.dmg\`, and a zipped \`.app\`."
+            echo "This workflow intentionally builds the unsigned \`.app\` bundle only, then zips it for download."
+            echo
+            echo "Do not rely on a DMG for unsigned CI testing. Use the zipped app bundle."
             echo
             echo "If macOS blocks launch on the test machine, run:"
             echo
@@ -65,9 +67,8 @@ jobs:
       - name: Upload macOS bundle artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: MediaTagger-macos-bundle
+          name: MediaTagger-macos-app
           path: |
-            src-tauri/target/release/bundle/dmg/*.dmg
             src-tauri/target/release/bundle/macos/*.app
             src-tauri/target/release/bundle/macos/*.app.zip
           if-no-files-found: error
