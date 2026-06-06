@@ -95,11 +95,13 @@ open "MediaTagger.app"
 
 6. If the app still looks blocked, right-click it in Finder and choose **Open** once.
 
-This workflow currently builds an unsigned macOS bundle for testing. That is the right first step before wiring in Apple signing and notarization.
+This workflow currently builds an unsigned macOS `.app` bundle for testing and zips it for download. That is the right first step before wiring in Apple signing and notarization.
 
 ## Why the GitHub build may behave differently from a local Mac build
 
 Local Mac builds often launch more easily because they were created directly on the machine you are testing. A downloaded unsigned artifact from GitHub usually gets quarantined by macOS, which can make it fail to launch until quarantine is removed.
+
+Unsigned DMGs are especially fragile here and may show up as "damaged" even when the app itself is fine. For CI-based unsigned testing, prefer the zipped `.app` bundle instead of the DMG.
 
 That is a packaging/distribution behavior, not necessarily an app-core failure.
 

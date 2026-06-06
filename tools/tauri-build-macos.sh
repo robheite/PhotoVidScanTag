@@ -41,8 +41,8 @@ else
 fi
 
 if [[ "$UNSIGNED" -eq 1 ]]; then
-  echo "Running unsigned macOS build..."
-  npm run tauri build
+  echo "Running unsigned macOS app-bundle build..."
+  npm run tauri build -- --bundles app
 else
   echo "Running macOS build using any signing/notarization environment already configured..."
   npm run tauri build
@@ -53,6 +53,11 @@ echo "Build complete."
 echo "Bundle output:"
 find src-tauri/target/release/bundle -maxdepth 3 \( -name '*.app' -o -name '*.dmg' -o -name '*.app.tar.gz' -o -name '*.zip' \) -print || true
 echo
+if [[ "$UNSIGNED" -eq 1 ]]; then
+  echo "Unsigned test builds intentionally ship the .app bundle only."
+  echo "DMG packaging is reserved for signed/notarized release-oriented builds."
+  echo
+fi
 echo "If this is an unsigned first-run build on macOS, you may need:"
 echo "  xattr -dr com.apple.quarantine <path-to-app-or-dmg>"
 echo "and then launch the app with Finder Open, or from Terminal:"
