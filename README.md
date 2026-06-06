@@ -61,6 +61,50 @@ npm run tauri:build:macos
 
 See [MAC_BUILD.md](/I:/PhotoVidScanTag/MAC_BUILD.md) for the dedicated macOS branch workflow and release checklist.
 
+## macOS local build from downloaded source
+
+If you download the repo source onto the Mac and want to build locally, use these exact steps:
+
+1. Download the project source zip.
+2. Double-click the zip in Finder so it extracts the project folder.
+3. Open **Terminal**:
+   - press `Command + Space`
+   - type `Terminal`
+   - press `Return`
+4. In Terminal, change into the extracted project folder.
+5. Change into the `tools` folder:
+
+```bash
+cd tools
+```
+
+6. Make the Mac build helper executable:
+
+```bash
+chmod +x tauri-build-macos.sh
+```
+
+7. Run the helper:
+
+```bash
+./tauri-build-macos.sh
+```
+
+8. Wait for the build to finish.
+9. When it completes, go to:
+
+```text
+src-tauri/target/release/bundle
+```
+
+10. Open `MediaTagger.app` from the generated bundle output.
+11. If macOS blocks the app on first run, in Terminal run:
+
+```bash
+xattr -dr com.apple.quarantine "MediaTagger.app"
+open "MediaTagger.app"
+```
+
 ## macOS test install from GitHub
 
 Use these exact steps for an unsigned Mac test build:
