@@ -1,7 +1,7 @@
 {
   "name": "mediatagger",
   "private": true,
-  "version": "1.1.6",
+  "version": "1.1.7",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -9,7 +9,11 @@
     "preview": "vite preview",
     "version:sync": "node tools/sync-version.mjs",
     "tauri": "tauri",
-    "tauri:dev:windows": "powershell -ExecutionPolicy Bypass -File tools/tauri-dev-windows.ps1"
+    "tauri:dev:windows": "powershell -ExecutionPolicy Bypass -File tools/tauri-dev-windows.ps1",
+    "tauri:build:macos": "bash tools/tauri-build-macos.sh",
+    "tauri:build:macos:unsigned": "bash tools/tauri-build-macos.sh --unsigned",
+    "install:macos-local": "bash tools/install-macos-local.sh",
+    "install:macos-local:open": "bash tools/install-macos-local.sh --open"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
