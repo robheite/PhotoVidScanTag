@@ -773,9 +773,10 @@ function App() {
 
   const folderTree = useMemo(() => buildFolderTree(scanPaths, scanFolders, mediaFiles), [scanPaths, scanFolders, mediaFiles]);
   const allFolderPaths = useMemo(() => collectNodePaths(folderTree), [folderTree]);
+  const allFolderPathSet = useMemo(() => new Set(allFolderPaths), [allFolderPaths]);
   const selectedFolderSet = useMemo(() => new Set(selectedFolderPaths), [selectedFolderPaths]);
   const activeFolderFilterCount = allFolderPaths.length
-    ? selectedFolderPaths.filter((path: string) => allFolderPaths.includes(path)).length
+    ? selectedFolderPaths.filter((path: string) => allFolderPathSet.has(path)).length
     : 0;
   const activeFileTypeLabel = `${selectedExtensions.length}/${availableExtensions.length || 0} file types`;
 
@@ -5569,60 +5570,86 @@ function formatDuration(durationSeconds: number) {
 }
 
 function buildFolderTree(scanPaths: string[], scanFolders: ScanFolder[], mediaFiles: MediaFile[]) {
-  const countByFolder = new Map<string, number>();
-  for (const file of mediaFiles.filter((item) => !item.missing)) {
-    const folderPath = fileFolderPath(file.path);
-    countByFolder.set(folderPath, (countByFolder.get(folderPath) ?? 0) + 1);
-  }
-
-  return scanPaths.map((rootPath) => {
+  const nodeByPath = new Map<string, FolderNode>();
+  const rootNodes = scanPaths.map((rootPath) => {
     const root: FolderNode = {
       label: folderLabel(rootPath),
       path: rootPath,
-      count: countFilesUnderFolder(rootPath, countByFolder),
+      count: 0,
       children: []
     };
+    nodeByPath.set(normalizePathKey(rootPath), root);
+    return root;
+  });
 
+  for (const rootPath of scanPaths) {
     const foldersForRoot = scanFolders
       .filter((folder) => folder.scanRoot === rootPath)
       .map((folder) => folder.path)
-      .filter((folderPath) => folderPath !== rootPath);
+      .filter((folderPath) => folderPath !== rootPath)
+      .sort((left, right) => pathDepth(left) - pathDepth(right));
 
     for (const folderPath of foldersForRoot) {
       const relative = relativePath(rootPath, folderPath);
       const folderParts = relative.split(/[\\/]/).filter(Boolean);
-      let current = root;
+      let current = nodeByPath.get(normalizePathKey(rootPath));
+      if (!current) {
+        continue;
+      }
       let currentPath = rootPath;
 
       for (const folderPart of folderParts) {
         currentPath = joinDisplayPath(currentPath, folderPart);
-        let child = current.children.find((node) => node.label === folderPart);
+        const normalizedCurrentPath = normalizePathKey(currentPath);
+        let child = nodeByPath.get(normalizedCurrentPath);
         if (!child) {
           child = {
             label: folderPart,
             path: currentPath,
-            count: countFilesUnderFolder(currentPath, countByFolder),
+            count: 0,
             children: []
           };
+          nodeByPath.set(normalizedCurrentPath, child);
           current.children.push(child);
         }
         current = child;
       }
     }
+  }
 
-    sortFolderTree(root);
-    return root;
-  });
-}
+  for (const file of mediaFiles) {
+    if (file.missing) {
+      continue;
+    }
 
-function countFilesUnderFolder(folderPath: string, countByFolder: Map<string, number>) {
-  let count = 0;
-  for (const [fileFolder, folderCount] of countByFolder) {
-    if (fileFolder === folderPath || isPathInside(fileFolder, folderPath)) {
-      count += folderCount;
+    const rootPath = scanPaths.find((path) => isPathInside(file.path, path));
+    if (!rootPath) {
+      continue;
+    }
+
+    let currentPath = fileFolderPath(file.path);
+    const rootKey = normalizePathKey(rootPath);
+
+    while (currentPath) {
+      const node = nodeByPath.get(normalizePathKey(currentPath));
+      if (node) {
+        node.count += 1;
+      }
+
+      if (normalizePathKey(currentPath) === rootKey) {
+        break;
+      }
+
+      const nextPath = parentFolderPath(currentPath);
+      if (!nextPath || nextPath === currentPath) {
+        break;
+      }
+      currentPath = nextPath;
     }
   }
-  return count;
+
+  rootNodes.forEach(sortFolderTree);
+  return rootNodes;
 }
 
 function sortFolderTree(node: FolderNode) {
@@ -5635,14 +5662,16 @@ function collectNodePaths(nodes: FolderNode[]): string[] {
 }
 
 function mergeKnownPaths(currentPaths: string[], knownPaths: string[]) {
-  const filtered = currentPaths.filter((path) => knownPaths.includes(path));
-  const additions = knownPaths.filter((path) => !filtered.includes(path));
+  const knownPathSet = new Set(knownPaths);
+  const filtered = currentPaths.filter((path) => knownPathSet.has(path));
+  const filteredSet = new Set(filtered);
+  const additions = knownPaths.filter((path) => !filteredSet.has(path));
   return [...filtered, ...additions];
 }
 
 function isPathInside(filePath: string, folderPath: string) {
-  const normalizedFilePath = filePath.toLowerCase();
-  const normalizedFolderPath = folderPath.replace(/[\\/]+$/, "").toLowerCase();
+  const normalizedFilePath = normalizePathKey(filePath);
+  const normalizedFolderPath = normalizePathKey(folderPath);
   return normalizedFilePath === normalizedFolderPath || normalizedFilePath.startsWith(`${normalizedFolderPath}\\`) || normalizedFilePath.startsWith(`${normalizedFolderPath}/`);
 }
 
@@ -5661,9 +5690,32 @@ function fileFolderPath(filePath: string) {
   return parts.join(filePath.includes("\\") ? "\\" : "/");
 }
 
+function parentFolderPath(folderPath: string) {
+  const trimmedPath = folderPath.replace(/[\\/]+$/, "");
+  const separator = trimmedPath.includes("\\") ? "\\" : "/";
+  const parts = trimmedPath.split(/[\\/]/);
+  if (parts.length <= 1) {
+    return "";
+  }
+  parts.pop();
+  const parent = parts.join(separator);
+  if (/^[A-Za-z]:$/.test(parent)) {
+    return `${parent}${separator}`;
+  }
+  return parent;
+}
+
 function joinDisplayPath(parent: string, child: string) {
   const separator = parent.includes("\\") ? "\\" : "/";
   return `${parent.replace(/[\\/]+$/, "")}${separator}${child}`;
+}
+
+function normalizePathKey(path: string) {
+  return path.replace(/[\\/]+$/, "").toLowerCase();
+}
+
+function pathDepth(path: string) {
+  return path.split(/[\\/]/).filter(Boolean).length;
 }
 
 function groupExtensions(extensions: string[]) {

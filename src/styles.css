@@ -16,7 +16,7 @@
 
 body {
   margin: 0;
-  min-width: 1024px;
+  min-width: 0;
   min-height: 100vh;
   overflow: hidden;
 }
@@ -40,6 +40,7 @@ button:disabled {
   display: grid;
   grid-template-columns: 212px 5px 1fr;
   height: 100vh;
+  min-width: 0;
 }
 
 .sidebar {
@@ -178,6 +179,7 @@ button:disabled {
 
 .topbar {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   gap: 8px;
 }
@@ -201,8 +203,14 @@ button:disabled {
 .filter-row,
 .toolbar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 5px;
+}
+
+.topbar-actions,
+.view-actions {
+  justify-content: flex-end;
 }
 
 .primary-button,
@@ -226,7 +234,7 @@ button:disabled {
 
 .summary-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(150px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 6px;
 }
 
@@ -259,7 +267,7 @@ button:disabled {
   grid-template-columns: minmax(240px, 30%) 5px 1fr;
   min-height: 0;
   flex: 1;
-  overflow: visible;
+  overflow: auto;
 }
 
 .content-single {
@@ -319,6 +327,7 @@ button:disabled {
 
 .panel-header {
   display: flex;
+  flex-wrap: wrap;
   align-items: flex-start;
   justify-content: space-between;
   gap: 10px;
@@ -1307,6 +1316,7 @@ button:disabled {
   flex: 1;
   gap: 6px;
   min-width: 180px;
+  max-width: 100%;
   height: 32px;
   padding: 0 8px;
   border: 1px solid #d8d3c8;
@@ -1939,6 +1949,10 @@ button:disabled {
 }
 
 @media (max-height: 820px), (max-width: 1280px) {
+  .app-shell {
+    grid-template-columns: 188px 5px minmax(0, 1fr);
+  }
+
   .workspace {
     gap: 6px;
     padding: 8px;
@@ -1981,6 +1995,34 @@ button:disabled {
   .detail-panel {
     padding: 9px;
     gap: 7px;
+  }
+}
+
+@media (max-width: 1040px) {
+  .app-shell {
+    grid-template-columns: 168px 5px minmax(0, 1fr);
+  }
+
+  .brand span,
+  .panel-header p,
+  .topbar p {
+    display: none;
+  }
+
+  .content-split {
+    grid-template-columns: minmax(220px, 32%) 5px minmax(420px, 1fr);
+  }
+
+  .summary-grid {
+    grid-template-columns: repeat(2, minmax(130px, 1fr));
+  }
+
+  .filter-row label {
+    flex: 1 1 210px;
+  }
+
+  .filter-row label.tag-input {
+    flex: 1 1 180px;
   }
 }
 
