@@ -2184,6 +2184,27 @@ async fn generate_native_image_preview(
 }
 
 #[tauri::command]
+async fn generate_native_video_preview(
+    path: String,
+    max_dimension: Option<u32>,
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    let db_path = state
+        .db_path
+        .lock()
+        .map_err(|_| "Database state is unavailable".to_string())?
+        .clone();
+    let preview_path = PathBuf::from(path);
+    let dimension = max_dimension.unwrap_or(512).clamp(128, 2048);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        build_native_video_preview(&preview_path, &db_path, dimension)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
 async fn read_video_metadata_details(path: String) -> Result<VideoMetadataDetails, String> {
     let video_path = PathBuf::from(path);
     tauri::async_runtime::spawn_blocking(move || read_native_video_metadata(&video_path))
@@ -2688,7 +2709,12 @@ fn preview_cache_dir(db_path: &Path) -> PathBuf {
         .join("preview-cache")
 }
 
-fn native_preview_cache_path(db_path: &Path, path: &Path, max_dimension: u32) -> Result<PathBuf, String> {
+fn native_preview_cache_path(
+    db_path: &Path,
+    path: &Path,
+    max_dimension: u32,
+    output_extension: &str,
+) -> Result<PathBuf, String> {
     let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
     let modified = metadata
         .modified()
@@ -2701,8 +2727,9 @@ fn native_preview_cache_path(db_path: &Path, path: &Path, max_dimension: u32) ->
     hasher.update(modified.to_le_bytes());
     hasher.update(size.to_le_bytes());
     hasher.update(max_dimension.to_le_bytes());
+    hasher.update(output_extension.as_bytes());
     let key = format!("{:x}", hasher.finalize());
-    Ok(preview_cache_dir(db_path).join(format!("{key}.jpg")))
+    Ok(preview_cache_dir(db_path).join(format!("{key}.{output_extension}")))
 }
 
 #[cfg(target_os = "windows")]
@@ -2816,13 +2843,102 @@ fn build_native_image_preview(
         return Ok(None);
     }
 
-    let cache_path = native_preview_cache_path(db_path, path, max_dimension)?;
+    let cache_path = native_preview_cache_path(db_path, path, max_dimension, "jpg")?;
     if cache_path.exists() {
         return Ok(Some(cache_path.to_string_lossy().to_string()));
     }
 
     fs::create_dir_all(preview_cache_dir(db_path)).map_err(|error| error.to_string())?;
     generate_native_image_preview_file(path, &cache_path, max_dimension)?;
+    Ok(Some(cache_path.to_string_lossy().to_string()))
+}
+
+#[cfg(target_os = "macos")]
+fn generate_native_video_preview_file(
+    input_path: &Path,
+    output_path: &Path,
+    max_dimension: u32,
+) -> Result<(), String> {
+    let cache_parent = output_path
+        .parent()
+        .ok_or_else(|| "Preview cache path has no parent directory".to_string())?;
+    let output_stem = output_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "Preview cache path has no usable filename".to_string())?;
+    let temp_dir = cache_parent.join(format!("{output_stem}.quicklook"));
+    if temp_dir.exists() {
+        fs::remove_dir_all(&temp_dir).map_err(|error| error.to_string())?;
+    }
+    fs::create_dir_all(&temp_dir).map_err(|error| error.to_string())?;
+
+    let status = std::process::Command::new("qlmanage")
+        .args(["-t", "-s", &max_dimension.to_string(), "-o"])
+        .arg(&temp_dir)
+        .arg(input_path)
+        .status()
+        .map_err(|error| error.to_string())?;
+
+    if !status.success() {
+        let _ = fs::remove_dir_all(&temp_dir);
+        return Err(format!(
+            "macOS native video preview generation failed with status {status}"
+        ));
+    }
+
+    let generated_preview = fs::read_dir(&temp_dir)
+        .map_err(|error| error.to_string())?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.extension()
+                .and_then(|value| value.to_str())
+                .map(|value| value.eq_ignore_ascii_case("png"))
+                .unwrap_or(false)
+        });
+
+    let generated_preview =
+        generated_preview.ok_or_else(|| "Quick Look did not produce a video thumbnail".to_string())?;
+    fs::copy(&generated_preview, output_path).map_err(|error| error.to_string())?;
+    fs::remove_dir_all(&temp_dir).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn generate_native_video_preview_file(
+    _input_path: &Path,
+    _output_path: &Path,
+    _max_dimension: u32,
+) -> Result<(), String> {
+    Err("Native video preview generation is not supported on this platform".to_string())
+}
+
+fn build_native_video_preview(
+    path: &Path,
+    db_path: &Path,
+    max_dimension: u32,
+) -> Result<Option<String>, String> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    if !matches!(extension.as_str(), "mp4" | "mov" | "m4v" | "webm") {
+        return Ok(None);
+    }
+
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let cache_path = native_preview_cache_path(db_path, path, max_dimension, "png")?;
+    if cache_path.exists() {
+        return Ok(Some(cache_path.to_string_lossy().to_string()));
+    }
+
+    fs::create_dir_all(preview_cache_dir(db_path)).map_err(|error| error.to_string())?;
+    generate_native_video_preview_file(path, &cache_path, max_dimension)?;
     Ok(Some(cache_path.to_string_lossy().to_string()))
 }
 
@@ -3586,6 +3702,7 @@ pub fn run() {
             scan_media,
             hydrate_media_dimensions,
             generate_native_image_preview,
+            generate_native_video_preview,
             read_video_metadata_details,
             open_file_path,
             open_file_location,

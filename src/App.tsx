@@ -308,6 +308,13 @@ type PreviewWarmProgress = {
   running: boolean;
 };
 
+type PreviewCheckReport = {
+  checked: number;
+  ready: number;
+  failed: number;
+  details: string[];
+};
+
 type IndexedMediaFile = {
   file: MediaFile;
   folderPath: string;
@@ -330,10 +337,13 @@ const videoMetadataCache = new Map<string, VideoMetadataResult>();
 const videoMetadataInflight = new Map<string, Promise<VideoMetadataResult>>();
 const nativeImagePreviewCache = new Map<string, string | null>();
 const nativeImagePreviewInflight = new Map<string, Promise<string | null>>();
+const nativeVideoPreviewCache = new Map<string, string | null>();
+const nativeVideoPreviewInflight = new Map<string, Promise<string | null>>();
 const imageMetadataHydrationAttempts = new Set<number>();
 const videoThumbnailQueue: LimitedQueue = { active: 0, limit: 2, pending: [] };
 const videoMetadataQueue: LimitedQueue = { active: 0, limit: 2, pending: [] };
 const nativeImagePreviewQueue: LimitedQueue = { active: 0, limit: 2, pending: [] };
+const nativeVideoPreviewQueue: LimitedQueue = { active: 0, limit: 2, pending: [] };
 type GridColumnSet = "media" | "duplicate" | "move";
 
 type OperationHistoryEntry = {
@@ -670,6 +680,7 @@ function App() {
   const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
   const [lastScanExecutionReport, setLastScanExecutionReport] = useState<ScanExecutionReport | null>(null);
   const [previewWarmProgress, setPreviewWarmProgress] = useState<PreviewWarmProgress | null>(null);
+  const [previewCheckReport, setPreviewCheckReport] = useState<PreviewCheckReport | null>(null);
   const [status, setStatus] = useState("Ready");
   const [isScanning, setIsScanning] = useState(false);
   const [searchText, setSearchText] = useState("");
@@ -1143,7 +1154,10 @@ function App() {
   const warmableNativePreviewFiles = useMemo(
     () =>
       mediaFiles.filter(
-        (item) => !item.missing && scanPaths.includes(item.scanRoot) && canNativePreviewExtension(item.extension)
+        (item) =>
+          !item.missing &&
+          scanPaths.includes(item.scanRoot) &&
+          (canNativePreviewExtension(item.extension) || canVideoPreviewExtension(item.extension))
       ),
     [mediaFiles, scanPaths]
   );
@@ -1676,7 +1690,7 @@ function App() {
     }
 
     if (!warmableNativePreviewFiles.length) {
-      setStatus("No native-preview image files are available for warm-up in the selected scan roots");
+      setStatus("No native-preview media files are available for warm-up in the selected scan roots");
       return;
     }
 
@@ -1691,7 +1705,7 @@ function App() {
       currentFilename: null,
       running: true
     });
-    setStatus(`Warming native previews for ${total.toLocaleString()} file(s) in the background...`);
+    setStatus(`Warming native previews for ${total.toLocaleString()} media file(s) in the background...`);
 
     let processed = 0;
     let available = 0;
@@ -1706,7 +1720,10 @@ function App() {
         await waitForNativePreviewQueueIdle();
         await waitForMainThreadIdle();
 
-        const previewSrc = await loadNativeImagePreview(item.path);
+        const previewSrc =
+          item.mediaType === "video"
+            ? await loadNativeVideoPreview(item.path)
+            : await loadNativeImagePreview(item.path);
         if (previewWarmRunRef.current !== runId) {
           return;
         }
@@ -1754,6 +1771,69 @@ function App() {
       });
       setStatus(`Native preview warm-up failed: ${String(error)}`);
     }
+  }
+
+  async function checkPreviewSamples() {
+    const samplesByExtension = new Map<string, MediaFile>();
+    for (const item of visibleMediaFiles) {
+      if (item.missing) {
+        continue;
+      }
+
+      const extension = item.extension.toLowerCase();
+      if (!samplesByExtension.has(extension)) {
+        samplesByExtension.set(extension, item);
+      }
+    }
+
+    const samples = [...samplesByExtension.values()].slice(0, 40);
+    if (!samples.length) {
+      setStatus("No visible media files are available for preview checks");
+      return;
+    }
+
+    setStatus(`Checking preview support for ${samples.length.toLocaleString()} extension sample(s)...`);
+    const details: string[] = [];
+    let ready = 0;
+    let failed = 0;
+
+    for (const item of samples) {
+      await waitForMainThreadIdle();
+      const extensionLabel = `.${item.extension.toLowerCase()}`;
+      let ok = false;
+      let path = "unsupported";
+
+      if (item.mediaType === "video" && canVideoPreviewExtension(item.extension)) {
+        path = "native/video";
+        ok = Boolean(await loadNativeVideoPreview(item.path));
+        if (!ok) {
+          path = "canvas/video";
+          ok = Boolean(await loadVideoThumbnail(item.path));
+        }
+      } else if (canNativePreviewExtension(item.extension)) {
+        path = "native/image";
+        ok = Boolean(await loadNativeImagePreview(item.path));
+      } else if (canPreviewExtension(item.extension)) {
+        path = "asset/image";
+        ok = await testImagePreview(item.path);
+      }
+
+      if (ok) {
+        ready += 1;
+      } else {
+        failed += 1;
+      }
+      details.push(`${extensionLabel} ${item.mediaType}: ${ok ? "ready" : "failed"} via ${path}`);
+    }
+
+    const report = {
+      checked: samples.length,
+      ready,
+      failed,
+      details
+    };
+    setPreviewCheckReport(report);
+    setStatus(`Preview check complete: ${ready.toLocaleString()} ready, ${failed.toLocaleString()} failed`);
   }
 
   useEffect(() => {
@@ -4284,7 +4364,25 @@ function App() {
                     <FileImage size={16} />
                     {previewWarmProgress?.running ? "Warming previews..." : "Warm previews"}
                   </button>
+                  <button
+                    onClick={() => void checkPreviewSamples()}
+                    disabled={isBusy || previewWarmProgress?.running || !visibleMediaFiles.some((item) => !item.missing)}
+                  >
+                    <Film size={16} />
+                    Check previews
+                  </button>
                 </div>
+                {previewCheckReport ? (
+                  <div className="warm-preview-summary">
+                    <span>
+                      Preview check: {previewCheckReport.ready.toLocaleString()}/{previewCheckReport.checked.toLocaleString()} ready
+                    </span>
+                    {previewCheckReport.failed ? <span>{previewCheckReport.failed.toLocaleString()} failed</span> : null}
+                    {previewCheckReport.details.slice(0, 8).map((detail) => (
+                      <span key={detail}>{detail}</span>
+                    ))}
+                  </div>
+                ) : null}
                 {scanProgress ? (
                   <div className="planner-section scan-progress-panel">
                     <div className="move-report-header">
@@ -5456,6 +5554,56 @@ function loadNativeImagePreview(path: string): Promise<string | null> {
   return previewPromise;
 }
 
+function loadNativeVideoPreview(path: string): Promise<string | null> {
+  if (nativeVideoPreviewCache.has(path)) {
+    return Promise.resolve(nativeVideoPreviewCache.get(path) ?? null);
+  }
+
+  const inflight = nativeVideoPreviewInflight.get(path);
+  if (inflight) {
+    return inflight;
+  }
+
+  const previewPromise = runQueuedTask(nativeVideoPreviewQueue, async () => {
+    try {
+      const previewPath = await invoke<string | null>("generate_native_video_preview", {
+        path,
+        maxDimension: 512
+      });
+      const previewSrc = previewPath ? convertFileSrc(previewPath) : null;
+      nativeVideoPreviewCache.set(path, previewSrc);
+      return previewSrc;
+    } catch {
+      nativeVideoPreviewCache.set(path, null);
+      return null;
+    }
+  });
+
+  nativeVideoPreviewInflight.set(path, previewPromise);
+  void previewPromise.finally(() => nativeVideoPreviewInflight.delete(path));
+  return previewPromise;
+}
+
+function testImagePreview(path: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const image = new Image();
+    const cleanup = () => {
+      image.onload = null;
+      image.onerror = null;
+    };
+
+    image.onload = () => {
+      cleanup();
+      resolve(true);
+    };
+    image.onerror = () => {
+      cleanup();
+      resolve(false);
+    };
+    image.src = convertFileSrc(path);
+  });
+}
+
 const PreviewImage = memo(function PreviewImage({ item }: { item: MediaFile }) {
   const [failed, setFailed] = useState(false);
   const [nativePreviewSrc, setNativePreviewSrc] = useState<string | null>(null);
@@ -5501,19 +5649,24 @@ const PreviewImage = memo(function PreviewImage({ item }: { item: MediaFile }) {
 const DetailPreview = memo(function DetailPreview({ item }: { item: MediaFile }) {
   const [failed, setFailed] = useState(false);
   const [nativePreviewSrc, setNativePreviewSrc] = useState<string | null>(null);
-  const needsNativePreview = !item.missing && canNativePreviewExtension(item.extension);
+  const needsNativeImagePreview = !item.missing && canNativePreviewExtension(item.extension);
+  const needsNativeVideoPreview = !item.missing && item.mediaType === "video" && canVideoPreviewExtension(item.extension);
 
   useEffect(() => {
     let canceled = false;
 
-    if (!needsNativePreview) {
+    if (!needsNativeImagePreview && !needsNativeVideoPreview) {
       setNativePreviewSrc(null);
       return;
     }
 
     setFailed(false);
-    setNativePreviewSrc(nativeImagePreviewCache.get(item.path) ?? null);
-    void loadNativeImagePreview(item.path).then((previewSrc) => {
+    setNativePreviewSrc(
+      needsNativeVideoPreview
+        ? nativeVideoPreviewCache.get(item.path) ?? null
+        : nativeImagePreviewCache.get(item.path) ?? null
+    );
+    void (needsNativeVideoPreview ? loadNativeVideoPreview(item.path) : loadNativeImagePreview(item.path)).then((previewSrc) => {
       if (!canceled) {
         setNativePreviewSrc(previewSrc);
       }
@@ -5522,17 +5675,20 @@ const DetailPreview = memo(function DetailPreview({ item }: { item: MediaFile })
     return () => {
       canceled = true;
     };
-  }, [item.path, needsNativePreview]);
+  }, [item.path, needsNativeImagePreview, needsNativeVideoPreview]);
 
   if (item.missing) {
     return <FileImage size={56} />;
   }
 
   if (item.mediaType === "video" && canVideoPreviewExtension(item.extension)) {
+    if (failed && nativePreviewSrc) {
+      return <img src={nativePreviewSrc} alt="" loading="lazy" />;
+    }
     return <video src={convertFileSrc(item.path)} controls muted preload="metadata" onError={() => setFailed(true)} />;
   }
 
-  if (needsNativePreview && nativePreviewSrc && !failed) {
+  if (needsNativeImagePreview && nativePreviewSrc && !failed) {
     return <img src={nativePreviewSrc} alt="" onError={() => setFailed(true)} loading="lazy" />;
   }
 
@@ -5618,8 +5774,8 @@ const VideoThumbnail = memo(function VideoThumbnail({ item }: { item: MediaFile 
 
     let canceled = false;
     setFailed(false);
-    setThumbnailSrc(videoThumbnailCache.get(item.path) ?? null);
-    void loadVideoThumbnail(item.path).then((thumbnail) => {
+    setThumbnailSrc(nativeVideoPreviewCache.get(item.path) ?? videoThumbnailCache.get(item.path) ?? null);
+    void loadNativeVideoPreview(item.path).then((nativeThumbnail) => nativeThumbnail ?? loadVideoThumbnail(item.path)).then((thumbnail) => {
       if (canceled) {
         return;
       }
