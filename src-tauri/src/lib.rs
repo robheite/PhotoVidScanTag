@@ -3408,10 +3408,50 @@ fn unix_now() -> i64 {
 }
 
 fn startup_log_path() -> PathBuf {
+    app_data_root().join("startup.log")
+}
+
+fn app_data_root() -> PathBuf {
     let base = dirs::data_local_dir()
+        .or_else(dirs::data_dir)
         .or_else(dirs::cache_dir)
         .unwrap_or_else(std::env::temp_dir);
-    base.join("MediaTagger").join("startup.log")
+    base.join("MediaTagger")
+}
+
+fn migrate_legacy_app_data(legacy_dir: &Path, app_data_dir: &Path) -> Result<(), String> {
+    if legacy_dir == app_data_dir || !legacy_dir.exists() {
+        return Ok(());
+    }
+
+    let legacy_db = legacy_dir.join("mediatagger.sqlite3");
+    let current_db = app_data_dir.join("mediatagger.sqlite3");
+    if !legacy_db.exists() || current_db.exists() {
+        return Ok(());
+    }
+
+    fs::create_dir_all(app_data_dir).map_err(|error| error.to_string())?;
+    copy_directory_contents(legacy_dir, app_data_dir)?;
+    Ok(())
+}
+
+fn copy_directory_contents(source: &Path, destination: &Path) -> Result<(), String> {
+    fs::create_dir_all(destination).map_err(|error| error.to_string())?;
+
+    for entry_result in fs::read_dir(source).map_err(|error| error.to_string())? {
+        let entry = entry_result.map_err(|error| error.to_string())?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let metadata = entry.metadata().map_err(|error| error.to_string())?;
+
+        if metadata.is_dir() {
+            copy_directory_contents(&source_path, &destination_path)?;
+        } else if metadata.is_file() && !destination_path.exists() {
+            fs::copy(&source_path, &destination_path).map_err(|error| error.to_string())?;
+        }
+    }
+
+    Ok(())
 }
 
 fn write_startup_log(message: &str) {
@@ -3448,10 +3488,13 @@ pub fn run() {
         .setup(move |app| {
             let setup_started = Instant::now();
             write_startup_log("setup() started");
-            let app_data_dir = app
+            let legacy_app_data_dir = app
                 .path()
                 .app_data_dir()
                 .map_err(|error| Box::<dyn std::error::Error>::from(error))?;
+            let app_data_dir = app_data_root();
+            migrate_legacy_app_data(&legacy_app_data_dir, &app_data_dir)
+                .map_err(Box::<dyn std::error::Error>::from)?;
             let app_startup_log_path = app_data_dir.join("startup.log");
             write_startup_log_to(&app_startup_log_path, "setup() started");
             write_startup_log(&format!("app data dir: {}", app_data_dir.display()));
@@ -3459,6 +3502,13 @@ pub fn run() {
                 &app_startup_log_path,
                 &format!("app data dir: {}", app_data_dir.display()),
             );
+            if legacy_app_data_dir != app_data_dir {
+                write_startup_log(&format!("legacy app data dir: {}", legacy_app_data_dir.display()));
+                write_startup_log_to(
+                    &app_startup_log_path,
+                    &format!("legacy app data dir: {}", legacy_app_data_dir.display()),
+                );
+            }
             fs::create_dir_all(&app_data_dir)?;
             let db_path = app_data_dir.join("mediatagger.sqlite3");
             write_startup_log(&format!("db path: {}", db_path.display()));
