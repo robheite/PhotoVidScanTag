@@ -1,12 +1,13 @@
 {
   "name": "mediatagger",
   "private": true,
-  "version": "1.1.3",
+  "version": "1.1.4",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
+    "version:sync": "node tools/sync-version.mjs",
     "tauri": "tauri",
     "tauri:dev:windows": "powershell -ExecutionPolicy Bypass -File tools/tauri-dev-windows.ps1"
   },

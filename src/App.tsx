@@ -452,6 +452,7 @@ function VirtualDataGrid<T>({
   const visibleEnd = Math.min(items.length, Math.ceil((scrollTop + viewportHeight) / rowHeight) + overscan);
   const visibleItems = items.slice(visibleStart, visibleEnd);
   const template = buildGridTemplate(columnWidths);
+  const gridWidth = columnWidths.reduce((total, width) => total + width, 0);
 
   return (
     <div
@@ -462,7 +463,7 @@ function VirtualDataGrid<T>({
     >
       {renderGridHeader(labels, columnSet, columnWidths, onBeginResize, rowClassName)}
       {items.length ? (
-        <div className="virtual-grid-body" style={{ height: items.length * rowHeight }}>
+        <div className="virtual-grid-body" style={{ height: items.length * rowHeight, minWidth: gridWidth }}>
           {visibleItems.map((item, index) => {
             const itemIndex = visibleStart + index;
             return (
@@ -473,6 +474,7 @@ function VirtualDataGrid<T>({
                 onClick={onRowClick ? () => onRowClick(item, itemIndex) : undefined}
                 style={{
                   gridTemplateColumns: template,
+                  minWidth: gridWidth,
                   top: itemIndex * rowHeight,
                   height: rowHeight
                 }}
@@ -577,6 +579,83 @@ function VirtualMediaGrid<T>({
   );
 }
 
+function VirtualDuplicateGroupList({
+  groups,
+  activeGroupKey,
+  activeMode,
+  duplicateScanResult,
+  duplicateMatchMode,
+  onSelectGroup
+}: {
+  groups: DuplicateGroup[];
+  activeGroupKey: string | null;
+  activeMode: DuplicateMatchMode;
+  duplicateScanResult: DuplicateScanResponse | null;
+  duplicateMatchMode: DuplicateMatchMode;
+  onSelectGroup: (group: DuplicateGroup) => void;
+}) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportHeight, setViewportHeight] = useState(320);
+
+  useEffect(() => {
+    const element = containerRef.current;
+    if (!element) {
+      return;
+    }
+
+    const updateHeight = () => setViewportHeight(element.clientHeight);
+    updateHeight();
+
+    const observer = new ResizeObserver(updateHeight);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  const rowHeight = 92;
+  const overscan = 8;
+  const visibleStart = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan);
+  const visibleEnd = Math.min(groups.length, Math.ceil((scrollTop + viewportHeight) / rowHeight) + overscan);
+  const visibleGroups = groups.slice(visibleStart, visibleEnd);
+
+  return (
+    <div
+      className="duplicate-group-list virtual-duplicate-list"
+      ref={containerRef}
+      onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
+    >
+      {groups.length ? (
+        <div className="virtual-duplicate-list-body" style={{ height: groups.length * rowHeight }}>
+          {visibleGroups.map((group, index) => {
+            const itemIndex = visibleStart + index;
+            return (
+              <button
+                className={`duplicate-group-card ${activeGroupKey === group.key ? "active" : ""}`}
+                key={group.key}
+                onClick={() => onSelectGroup(group)}
+                style={{ top: itemIndex * rowHeight, height: rowHeight - 7 }}
+              >
+                <div className="duplicate-group-top">
+                  <strong>{group.fileCount} matching files</strong>
+                  <span>{formatFileSize(group.wastedSizeBytes)} reclaimable</span>
+                </div>
+                <small>{group.items[0]?.filename ?? "Duplicate group"}</small>
+                <small>{group.items[0]?.scanRoot ?? group.items[0]?.path ?? ""}</small>
+              </button>
+            );
+          })}
+        </div>
+      ) : (
+        <div className="empty-state wide">
+          {duplicateScanResult
+            ? `No ${activeMode === "exact" ? "duplicate" : "probable duplicate"} groups match the current search.`
+            : `Run Find ${duplicateMatchMode === "exact" ? "exact" : "probable"} to build the review list.`}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function App() {
   const [scanPaths, setScanPaths] = useState<string[]>([]);
   const [availableExtensions, setAvailableExtensions] = useState<string[]>([]);
@@ -618,6 +697,15 @@ function App() {
   const [expandedFolderPaths, setExpandedFolderPaths] = useState<string[]>([]);
   const [selectedFolderPaths, setSelectedFolderPaths] = useState<string[]>([]);
   const [activeSection, setActiveSection] = useState<AppSection>("Scan");
+  const [appMenuCollapsed, setAppMenuCollapsed] = useState(false);
+  const [summaryCollapsed, setSummaryCollapsed] = useState(false);
+  const [sidePanelCollapsed, setSidePanelCollapsed] = useState<Record<AppSection, boolean>>({
+    Scan: false,
+    Library: false,
+    Duplicates: false,
+    "Move/Copy": false,
+    Settings: true
+  });
   const [thumbnailSize, setThumbnailSize] = useState<ThumbnailSize>("medium");
   const [libraryPageSize, setLibraryPageSize] = useState<number>(50);
   const [libraryPage, setLibraryPage] = useState<number>(1);
@@ -1010,22 +1098,27 @@ function App() {
     () => duplicateItems.filter((item) => selectedFileIdSet.has(item.id)),
     [duplicateItems, selectedFileIdSet]
   );
-  const selectedDuplicateItemsGlobal = useMemo(() => {
-    const seenIds = new Set<number>();
-    const selectedItems: MediaFile[] = [];
-
+  const duplicateFileById = useMemo(() => {
+    const duplicateMap = new Map<number, MediaFile>();
     for (const group of duplicateGroups) {
       for (const item of group.items) {
-        if (seenIds.has(item.id) || !selectedFileIdSet.has(item.id)) {
-          continue;
+        if (!duplicateMap.has(item.id)) {
+          duplicateMap.set(item.id, item);
         }
-        seenIds.add(item.id);
+      }
+    }
+    return duplicateMap;
+  }, [duplicateGroups]);
+  const selectedDuplicateItemsGlobal = useMemo(() => {
+    const selectedItems: MediaFile[] = [];
+    for (const id of selectedFileIds) {
+      const item = duplicateFileById.get(id);
+      if (item) {
         selectedItems.push(item);
       }
     }
-
     return selectedItems;
-  }, [duplicateGroups, selectedFileIdSet]);
+  }, [duplicateFileById, selectedFileIds]);
   const selectedDuplicateCount = useMemo(
     () => selectedDuplicateItems.length,
     [selectedDuplicateItems]
@@ -1042,9 +1135,8 @@ function App() {
     () => selectedDuplicateItemsGlobal.reduce((total, item) => total + item.fileSizeBytes, 0),
     [selectedDuplicateItemsGlobal]
   );
-  const fullySelectedDuplicateGroups = useMemo(
-    () =>
-      duplicateGroups.filter((group) => group.items.length > 1 && group.items.every((item) => selectedFileIdSet.has(item.id))),
+  const fullySelectedDuplicateGroupCount = useMemo(
+    () => duplicateGroups.reduce((count, group) => count + (group.items.length > 1 && group.items.every((item) => selectedFileIdSet.has(item.id)) ? 1 : 0), 0),
     [duplicateGroups, selectedFileIdSet]
   );
   const warmableNativePreviewFiles = useMemo(
@@ -1082,9 +1174,8 @@ function App() {
 
   const configuredRootCount = Math.max(scanPaths.length, scanRoots.length);
   const duplicateGroupCount = duplicateGroups.length;
-  const duplicateFileCount = duplicateScanResult?.duplicateFiles ?? duplicateGroups.reduce((sum, group) => sum + group.fileCount, 0);
-  const duplicateWasteMb =
-    duplicateScanResult?.wastedSizeMb ?? duplicateGroups.reduce((sum, group) => sum + group.wastedSizeMb, 0);
+  const duplicateFileCount = duplicateGroups.reduce((sum, group) => sum + group.fileCount, 0);
+  const duplicateWasteMb = duplicateGroups.reduce((sum, group) => sum + group.wastedSizeMb, 0);
   const isBusy = isScanning || isFindingDuplicates || isExecutingMoveCopy || isWarmingDuplicateHashes;
   const activeDuplicateMode = duplicateScanResult?.matchMode ?? duplicateMatchMode;
   const duplicateReviewReadOnly = activeDuplicateMode === "probable";
@@ -2616,12 +2707,40 @@ function App() {
       });
 
       await initializeAppData();
-      const refreshedDuplicates = await invoke<DuplicateScanResponse>(
-        duplicateMatchMode === "probable" ? "find_probable_duplicates" : "find_duplicates"
-      );
-      setDuplicateGroups(refreshedDuplicates.groups);
-      setDuplicateScanResult(refreshedDuplicates);
-      setActiveDuplicateGroupKey(refreshedDuplicates.groups[0]?.key ?? null);
+      setDuplicateGroups((currentGroups) => {
+        const nextGroups = currentGroups
+          .map((group) => {
+            const items = group.items.filter((item) => !selectedPathSet.has(item.path));
+            const fileCount = items.length;
+            const wastedSizeBytes = fileCount > 1 ? items.slice(1).reduce((total, item) => total + item.fileSizeBytes, 0) : 0;
+            return {
+              ...group,
+              items,
+              fileCount,
+              wastedSizeBytes,
+              wastedSizeMb: wastedSizeBytes / (1024 * 1024)
+            };
+          })
+          .filter((group) => group.items.length > 1);
+
+        setDuplicateScanResult((currentResult) =>
+          currentResult
+            ? {
+                ...currentResult,
+                groups: nextGroups,
+                duplicateFiles: nextGroups.reduce((sum, group) => sum + group.fileCount, 0),
+                wastedSizeBytes: nextGroups.reduce((sum, group) => sum + group.wastedSizeBytes, 0),
+                wastedSizeMb: nextGroups.reduce((sum, group) => sum + group.wastedSizeMb, 0)
+              }
+            : currentResult
+        );
+        setActiveDuplicateGroupKey((currentKey) =>
+          currentKey && nextGroups.some((group) => group.key === currentKey)
+            ? currentKey
+            : nextGroups[0]?.key ?? null
+        );
+        return nextGroups;
+      });
       setSelectedFileIds([]);
       setDuplicateCleanupConfirmed(false);
       setDeleteDuplicateConfirmOpen(false);
@@ -2800,17 +2919,53 @@ function App() {
     );
   }
 
+  const activeSidePanelOpen = !sidePanelCollapsed[activeSection];
+  const activeSplitTemplate = activeSidePanelOpen
+    ? `${activeSplitWidth}px 7px minmax(0, 1fr)`
+    : "44px minmax(0, 1fr)";
+  const activeSidePanelLabel =
+    activeSection === "Scan"
+      ? "Scan Locations"
+      : activeSection === "Library"
+        ? "Library Folders"
+        : activeSection === "Duplicates"
+          ? "Duplicate Groups"
+          : activeSection === "Move/Copy"
+            ? "Plan Setup"
+            : "Scan Defaults";
+
+  function toggleSidePanel(section: AppSection = activeSection) {
+    setSidePanelCollapsed((current) => ({ ...current, [section]: !current[section] }));
+  }
+
+  function renderDrawerTab(section: AppSection, label: string) {
+    return (
+      <button className="drawer-tab" onClick={() => toggleSidePanel(section)} title={`Show ${label}`}>
+        <ChevronRight size={16} />
+        <span>{label}</span>
+      </button>
+    );
+  }
+
   return (
-    <main className="app-shell">
+    <main className={`app-shell ${appMenuCollapsed ? "menu-collapsed" : ""}`}>
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark">
             <FileImage size={22} />
           </div>
-          <div>
+          <div className="brand-text">
             <strong>MediaTagger</strong>
             <span>Photo and video library</span>
           </div>
+          <button
+            className="sidebar-collapse-button"
+            onClick={() => setAppMenuCollapsed((collapsed) => !collapsed)}
+            aria-label={appMenuCollapsed ? "Expand app menu" : "Collapse app menu"}
+            title={appMenuCollapsed ? "Expand app menu" : "Collapse app menu"}
+          >
+            {appMenuCollapsed ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}
+          </button>
         </div>
 
         <nav className="section-nav" aria-label="Application sections">
@@ -2830,7 +2985,7 @@ function App() {
                 }}
               >
                 <Icon size={18} />
-                {section.label}
+                <span className="nav-label">{section.label}</span>
               </button>
             );
           })}
@@ -2907,6 +3062,14 @@ function App() {
             </p>
           </div>
           <div className="topbar-actions">
+            <button className="secondary-button" onClick={() => toggleSidePanel()} title={`${activeSidePanelOpen ? "Hide" : "Show"} ${activeSidePanelLabel}`}>
+              {activeSidePanelOpen ? <ChevronLeft size={17} /> : <ChevronRight size={17} />}
+              {activeSidePanelOpen ? "Hide panel" : "Show panel"}
+            </button>
+            <button className="secondary-button" onClick={() => setSummaryCollapsed((collapsed) => !collapsed)}>
+              {summaryCollapsed ? <ChevronDown size={17} /> : <ChevronUp size={17} />}
+              {summaryCollapsed ? "Show summary" : "Hide summary"}
+            </button>
             <button className="secondary-button" onClick={initializeAppData} disabled={isBusy}>
               <RefreshCw size={17} />
               Reload library
@@ -2977,6 +3140,7 @@ function App() {
           </div>
         </header>
 
+        {!summaryCollapsed ? (
         <section className="summary-grid" aria-label="Library summary">
           <div className="metric">
             <Database size={20} />
@@ -3025,10 +3189,13 @@ function App() {
             </strong>
           </div>
         </section>
+        ) : null}
 
-        <div className="content-split" style={{ gridTemplateColumns: `${activeSplitWidth}px 7px minmax(0, 1fr)` }}>
+        <div className={`content-split ${activeSidePanelOpen ? "" : "drawer-collapsed"}`} style={{ gridTemplateColumns: activeSplitTemplate }}>
           {activeSection === "Settings" ? (
             <>
+              {activeSidePanelOpen ? (
+              <>
               <section className="panel settings-panel">
                 <div className="panel-header">
                   <div>
@@ -3074,6 +3241,10 @@ function App() {
               </section>
 
               <div className="resize-rail subtle" aria-hidden="true" onMouseDown={(event) => beginSplitResize("Settings", event.clientX)} />
+              </>
+              ) : (
+                renderDrawerTab("Settings", "Scan Defaults")
+              )}
 
               <section className="panel settings-panel">
                 <div className="panel-header">
@@ -3236,6 +3407,8 @@ function App() {
           ) : null}
           {activeSection === "Move/Copy" ? (
             <>
+              {activeSidePanelOpen ? (
+              <>
               <div className="move-left-column">
                 <section className="panel tree-panel move-plan-panel">
                   <div className="panel-header">
@@ -3453,6 +3626,10 @@ function App() {
               </div>
 
               <div className="resize-rail subtle" aria-hidden="true" onMouseDown={(event) => beginSplitResize("Move/Copy", event.clientX)} />
+              </>
+              ) : (
+                renderDrawerTab("Move/Copy", "Plan Setup")
+              )}
 
               <section className="panel library-panel move-preview-panel">
                 <div className="panel-header">
@@ -3522,6 +3699,8 @@ function App() {
           ) : null}
           {activeSection === "Duplicates" ? (
             <>
+              {activeSidePanelOpen ? (
+              <>
               <section className="panel tree-panel duplicate-groups-panel">
                 <div className="panel-header">
                   <div>
@@ -3540,36 +3719,24 @@ function App() {
                     {duplicateFileCount.toLocaleString()} {activeDuplicateMode === "exact" ? "duplicate" : "probable duplicate"} files found so far
                   </span>
                 </div>
-                <div className="duplicate-group-list">
-                  {filteredDuplicateGroups.length ? (
-                    filteredDuplicateGroups.map((group) => (
-                      <button
-                        className={`duplicate-group-card ${activeDuplicateGroup?.key === group.key ? "active" : ""}`}
-                        key={group.key}
-                        onClick={() => {
-                          setActiveDuplicateGroupKey(group.key);
-                          setActiveMediaId(group.items[0]?.id ?? null);
-                        }}
-                      >
-                        <div className="duplicate-group-top">
-                          <strong>{group.fileCount} matching files</strong>
-                          <span>{formatFileSize(group.wastedSizeBytes)} reclaimable</span>
-                        </div>
-                        <small>{group.items[0]?.filename ?? "Duplicate group"}</small>
-                        <small>{group.items[0]?.scanRoot ?? group.items[0]?.path ?? ""}</small>
-                      </button>
-                    ))
-                  ) : (
-                    <div className="empty-state wide">
-                      {duplicateScanResult
-                        ? `No ${activeDuplicateMode === "exact" ? "duplicate" : "probable duplicate"} groups match the current search.`
-                        : `Run Find ${duplicateMatchMode === "exact" ? "exact" : "probable"} to build the review list.`}
-                    </div>
-                  )}
-                </div>
+                <VirtualDuplicateGroupList
+                  groups={filteredDuplicateGroups}
+                  activeGroupKey={activeDuplicateGroup?.key ?? null}
+                  activeMode={activeDuplicateMode}
+                  duplicateScanResult={duplicateScanResult}
+                  duplicateMatchMode={duplicateMatchMode}
+                  onSelectGroup={(group) => {
+                    setActiveDuplicateGroupKey(group.key);
+                    setActiveMediaId(group.items[0]?.id ?? null);
+                  }}
+                />
               </section>
 
               <div className="resize-rail subtle" aria-hidden="true" onMouseDown={(event) => beginSplitResize("Duplicates", event.clientX)} />
+              </>
+              ) : (
+                renderDrawerTab("Duplicates", "Duplicate Groups")
+              )}
 
               <section className="panel library-panel duplicate-review-panel">
                 <div className="panel-header">
@@ -3721,9 +3888,9 @@ function App() {
                             ? `Move selected files to ${duplicateCleanupDestination}`
                             : "Choose a cleanup folder to move selected files"}
                         </span>
-                        {fullySelectedDuplicateGroups.length ? (
+                        {fullySelectedDuplicateGroupCount ? (
                           <span className="duplicate-preflight-warning">
-                            {fullySelectedDuplicateGroups.length.toLocaleString()} duplicate group(s) have every copy selected.
+                            {fullySelectedDuplicateGroupCount.toLocaleString()} duplicate group(s) have every copy selected.
                           </span>
                         ) : null}
                         {activeDuplicateIsSelected ? (
@@ -3943,6 +4110,8 @@ function App() {
           ) : null}
           {activeSection === "Scan" || activeSection === "Library" ? (
             <>
+          {activeSidePanelOpen ? (
+          <>
           <section className="panel tree-panel">
             <div className="panel-header">
               <div>
@@ -4188,6 +4357,10 @@ function App() {
             aria-hidden="true"
             onMouseDown={(event) => beginSplitResize(activeSection === "Library" ? "Library" : "Scan", event.clientX)}
           />
+          </>
+          ) : (
+            renderDrawerTab(activeSection, activeSection === "Scan" ? "Scan Locations" : "Library Folders")
+          )}
             </>
           ) : null}
 
@@ -4743,9 +4916,9 @@ function App() {
                 <span>
                   This will permanently remove the selected duplicate files from disk and mark them missing in the local scan cache.
                 </span>
-                {fullySelectedDuplicateGroups.length ? (
+                {fullySelectedDuplicateGroupCount ? (
                   <span className="duplicate-preflight-warning">
-                    Every copy is selected in {fullySelectedDuplicateGroups.length.toLocaleString()} duplicate group(s).
+                    Every copy is selected in {fullySelectedDuplicateGroupCount.toLocaleString()} duplicate group(s).
                   </span>
                 ) : null}
               </div>
@@ -4915,11 +5088,12 @@ function renderGridHeader(
   beginResize: (set: GridColumnSet, index: number, clientX: number) => void,
   className?: string
 ) {
+  const gridWidth = widths.reduce((total, width) => total + width, 0);
   return (
     <div
       className={`data-grid-row header ${className ?? ""}`.trim()}
       role="row"
-      style={{ gridTemplateColumns: buildGridTemplate(widths) }}
+      style={{ gridTemplateColumns: buildGridTemplate(widths), minWidth: gridWidth }}
     >
       {labels.map((label, index) => (
         <span className="grid-header-cell" key={`${set}-${label}-${index}`}>
@@ -5149,7 +5323,6 @@ function loadVideoThumbnail(path: string): Promise<string | null> {
       video.preload = "metadata";
       video.muted = true;
       video.playsInline = true;
-      video.crossOrigin = "anonymous";
 
       const cleanup = () => {
         video.pause();
@@ -5176,13 +5349,17 @@ function loadVideoThumbnail(path: string): Promise<string | null> {
           return;
         }
 
-        context.fillStyle = "#f8f7f3";
-        context.fillRect(0, 0, width, height);
-        context.drawImage(video, 0, 0, width, height);
-        const thumbnail = canvas.toDataURL("image/jpeg", 0.82);
-        videoThumbnailCache.set(path, thumbnail);
-        cleanup();
-        resolve(thumbnail);
+        try {
+          context.fillStyle = "#f8f7f3";
+          context.fillRect(0, 0, width, height);
+          context.drawImage(video, 0, 0, width, height);
+          const thumbnail = canvas.toDataURL("image/jpeg", 0.82);
+          videoThumbnailCache.set(path, thumbnail);
+          cleanup();
+          resolve(thumbnail);
+        } catch {
+          fail();
+        }
       };
 
       video.addEventListener("error", fail, { once: true });
