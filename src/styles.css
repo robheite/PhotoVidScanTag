@@ -38,15 +38,15 @@ button:disabled {
 
 .app-shell {
   display: grid;
-  grid-template-columns: 264px 7px 1fr;
+  grid-template-columns: 232px 7px 1fr;
   height: 100vh;
 }
 
 .sidebar {
   display: flex;
   flex-direction: column;
-  gap: 24px;
-  padding: 20px 14px;
+  gap: 16px;
+  padding: 14px 10px;
   border-right: 1px solid #d8d3c8;
   background: #fbfaf7;
 }
@@ -54,14 +54,14 @@ button:disabled {
 .brand {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 4px 6px;
+  gap: 10px;
+  padding: 2px 6px;
 }
 
 .brand-mark {
   display: grid;
-  width: 42px;
-  height: 42px;
+  width: 38px;
+  height: 38px;
   place-items: center;
   border-radius: 8px;
   color: #ffffff;
@@ -74,7 +74,7 @@ button:disabled {
 }
 
 .brand strong {
-  font-size: 17px;
+  font-size: 16px;
 }
 
 .brand span,
@@ -101,7 +101,7 @@ button:disabled {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  min-height: 36px;
+  min-height: 32px;
   border-radius: 7px;
   color: #263033;
   background: transparent;
@@ -170,16 +170,16 @@ button:disabled {
 .workspace {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
   min-width: 0;
-  padding: 16px;
+  padding: 12px;
   overflow: auto;
 }
 
 .topbar {
   display: flex;
   justify-content: space-between;
-  gap: 12px;
+  gap: 10px;
 }
 
 .topbar h1,
@@ -188,7 +188,7 @@ button:disabled {
 }
 
 .topbar h1 {
-  font-size: 24px;
+  font-size: 22px;
 }
 
 .topbar p,
@@ -202,14 +202,14 @@ button:disabled {
 .toolbar {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
 }
 
 .primary-button,
 .secondary-button,
 .filter-row button,
 .toolbar button {
-  padding: 0 12px;
+  padding: 0 10px;
 }
 
 .primary-button {
@@ -227,14 +227,14 @@ button:disabled {
 .summary-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(150px, 1fr));
-  gap: 10px;
+  gap: 8px;
 }
 
 .metric {
   display: grid;
   grid-template-columns: 24px 1fr;
-  gap: 4px 10px;
-  padding: 12px;
+  gap: 3px 8px;
+  padding: 9px;
   border: 1px solid #d8d3c8;
   border-radius: 8px;
   background: #ffffff;
@@ -251,7 +251,7 @@ button:disabled {
 }
 
 .metric strong {
-  font-size: 17px;
+  font-size: 16px;
 }
 
 .content-split {
@@ -466,7 +466,7 @@ button:disabled {
 }
 
 .duplicate-mode-toggle {
-  margin: 0 16px;
+  margin: 0 12px 4px;
 }
 
 .duplicate-review-readonly {
@@ -1028,7 +1028,7 @@ button:disabled {
 
 .duplicate-review-main {
   display: grid;
-  grid-template-rows: auto minmax(180px, 0.8fr) minmax(220px, 1fr);
+  grid-template-rows: auto minmax(190px, 1fr) minmax(150px, 0.7fr);
   min-height: 0;
   overflow: auto;
 }
@@ -1064,7 +1064,7 @@ button:disabled {
 .duplicate-group-summary {
   display: grid;
   gap: 4px;
-  padding: 0 16px 12px;
+  padding: 0 12px 8px;
 }
 
 .duplicate-group-summary span,
@@ -1080,7 +1080,7 @@ button:disabled {
 
 .duplicate-selection-toolbar {
   flex-wrap: wrap;
-  padding: 0 16px 12px;
+  padding: 0 12px 8px;
 }
 
 .duplicate-selection-note {
@@ -1089,15 +1089,25 @@ button:disabled {
 }
 
 .duplicate-cleanup-panel {
-  gap: 12px;
-  max-height: min(250px, 30vh);
+  gap: 8px;
+  max-height: min(220px, 26vh);
   overflow: auto;
   overscroll-behavior: contain;
 }
 
+.duplicate-cleanup-panel.collapsed {
+  padding-top: 8px;
+  padding-bottom: 8px;
+}
+
 .duplicate-move-options {
   display: grid;
-  gap: 12px;
+  gap: 10px;
+}
+
+.duplicate-compact-preflight {
+  color: #667172;
+  font-size: 12px;
 }
 
 .duplicate-warning-note {
@@ -1141,7 +1151,7 @@ button:disabled {
 
 .duplicate-review-grid {
   flex: 1 1 auto;
-  min-height: 260px;
+  min-height: 190px;
   height: auto;
   max-height: none;
 }
@@ -1570,9 +1580,9 @@ button:disabled {
 
 .duplicate-review-table {
   flex: 1 1 auto;
-  min-height: 220px;
+  min-height: 150px;
   max-height: none;
-  margin: 0 16px 16px;
+  margin: 0 12px 12px;
 }
 
 .scan-workbench .data-grid {
@@ -1926,6 +1936,52 @@ button:disabled {
   border: 1px solid #d8d3c8;
   border-radius: 8px;
   background: #ffffff;
+}
+
+@media (max-height: 820px), (max-width: 1280px) {
+  .workspace {
+    gap: 6px;
+    padding: 8px;
+  }
+
+  .sidebar {
+    gap: 12px;
+    padding: 10px 8px;
+  }
+
+  .summary-grid {
+    gap: 6px;
+  }
+
+  .metric {
+    padding: 7px;
+  }
+
+  .metric span {
+    font-size: 11px;
+  }
+
+  .metric strong {
+    font-size: 15px;
+  }
+
+  .panel-header {
+    padding: 12px;
+  }
+
+  .filter-row {
+    padding: 8px 12px;
+  }
+
+  .data-grid {
+    margin-right: 12px;
+    margin-left: 12px;
+  }
+
+  .detail-panel {
+    padding: 12px;
+    gap: 10px;
+  }
 }
 
 .status-primary,
