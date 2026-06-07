@@ -4,7 +4,7 @@ use std::{
     io::{BufReader, Read, Write},
     path::{Path, PathBuf},
     sync::Mutex,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use exif::{In, Reader as ExifReader, Tag};
@@ -32,6 +32,8 @@ struct OperationHistoryEntry {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AppSettings {
+    app_version: String,
+    app_identifier: String,
     selected_extensions: Vec<String>,
     default_thumbnail_size: String,
     default_library_page_size: i64,
@@ -2179,12 +2181,13 @@ fn read_app_settings(conn: &Connection, db_path: &Path) -> Result<AppSettings, S
         .map(|value| value == "1")
         .unwrap_or(true);
 
-    let app_data_dir = db_path
-        .parent()
-        .map(|path| path.to_string_lossy().to_string())
-        .unwrap_or_default();
+    let app_data_path = db_path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let app_data_dir = app_data_path.to_string_lossy().to_string();
+    let startup_log_path = app_data_path.join("startup.log");
 
     Ok(AppSettings {
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        app_identifier: "com.robheite.mediatagger".to_string(),
         selected_extensions,
         default_thumbnail_size,
         default_library_page_size,
@@ -2194,7 +2197,7 @@ fn read_app_settings(conn: &Connection, db_path: &Path) -> Result<AppSettings, S
         log_successful_operations,
         app_data_dir,
         database_path: db_path.to_string_lossy().to_string(),
-        startup_log_path: startup_log_path().to_string_lossy().to_string(),
+        startup_log_path: startup_log_path.to_string_lossy().to_string(),
     })
 }
 
@@ -3422,31 +3425,56 @@ fn write_startup_log(message: &str) {
     }
 }
 
+fn write_startup_log_to(path: &Path, message: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "[{}] {message}", unix_now());
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     std::panic::set_hook(Box::new(|panic_info| {
         write_startup_log(&format!("panic: {panic_info}"));
     }));
+    let app_started = Instant::now();
     write_startup_log("run() entered");
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .setup(|app| {
+        .setup(move |app| {
+            let setup_started = Instant::now();
             write_startup_log("setup() started");
             let app_data_dir = app
                 .path()
                 .app_data_dir()
                 .map_err(|error| Box::<dyn std::error::Error>::from(error))?;
+            let app_startup_log_path = app_data_dir.join("startup.log");
+            write_startup_log_to(&app_startup_log_path, "setup() started");
             write_startup_log(&format!("app data dir: {}", app_data_dir.display()));
+            write_startup_log_to(
+                &app_startup_log_path,
+                &format!("app data dir: {}", app_data_dir.display()),
+            );
             fs::create_dir_all(&app_data_dir)?;
             let db_path = app_data_dir.join("mediatagger.sqlite3");
             write_startup_log(&format!("db path: {}", db_path.display()));
+            write_startup_log_to(&app_startup_log_path, &format!("db path: {}", db_path.display()));
             let conn = Connection::open(&db_path)?;
             init_db(&conn)?;
             app.manage(AppState {
                 db_path: Mutex::new(db_path),
             });
-            write_startup_log("setup() completed");
+            let setup_ms = setup_started.elapsed().as_millis();
+            let startup_ms = app_started.elapsed().as_millis();
+            write_startup_log(&format!("setup() completed in {setup_ms} ms; app startup {startup_ms} ms"));
+            write_startup_log_to(
+                &app_startup_log_path,
+                &format!("setup() completed in {setup_ms} ms; app startup {startup_ms} ms"),
+            );
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

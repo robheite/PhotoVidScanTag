@@ -249,6 +249,8 @@ type CleanupDuplicatesResponse = {
 };
 
 type AppSettings = {
+  appVersion: string;
+  appIdentifier: string;
   selectedExtensions: string[];
   defaultThumbnailSize: ThumbnailSize;
   defaultLibraryPageSize: number;
@@ -1036,6 +1038,11 @@ function App() {
   const selectedDuplicateGlobalBytes = useMemo(
     () => selectedDuplicateItemsGlobal.reduce((total, item) => total + item.fileSizeBytes, 0),
     [selectedDuplicateItemsGlobal]
+  );
+  const fullySelectedDuplicateGroups = useMemo(
+    () =>
+      duplicateGroups.filter((group) => group.items.length > 1 && group.items.every((item) => selectedFileIdSet.has(item.id))),
+    [duplicateGroups, selectedFileIdSet]
   );
   const warmableNativePreviewFiles = useMemo(
     () =>
@@ -1847,6 +1854,20 @@ function App() {
     }
   }
 
+  async function openAppDataLocation() {
+    if (!appSettings?.appDataDir) {
+      setStatus("App data path is not available yet");
+      return;
+    }
+
+    try {
+      await invoke("open_file_location", { path: appSettings.appDataDir });
+      setStatus("Opened app data location");
+    } catch (error) {
+      setStatus(`Open app data location failed: ${String(error)}`);
+    }
+  }
+
   async function saveSettings() {
     if (!selectedExtensions.length) {
       setStatus("Enable at least one file type before saving settings");
@@ -2436,16 +2457,6 @@ function App() {
       return null;
     }
 
-    for (const group of duplicateGroups) {
-      const selectedCountInGroup = group.items.filter((item) => selectedFileIdSet.has(item.id)).length;
-      if (group.items.length > 1 && selectedCountInGroup === group.items.length) {
-        setStatus(
-          `All files in duplicate group ${group.items[0]?.filename ?? group.key} are selected. Use Keep active, clean rest or deselect the keeper first.`
-        );
-        return null;
-      }
-    }
-
     return selectedPaths;
   }
 
@@ -2886,9 +2897,9 @@ function App() {
               Reload library
             </button>
             {activeSection === "Settings" ? (
-              <button className="secondary-button" onClick={openSettingsLogLocation} disabled={!appSettings}>
+              <button className="secondary-button" onClick={openAppDataLocation} disabled={!appSettings}>
                 <FolderOpen size={17} />
-                Open log
+                Open app data
               </button>
             ) : (
               <button
@@ -3060,6 +3071,20 @@ function App() {
 
                 <div className="settings-scroll">
                   <div className="planner-section">
+                    <strong>About MediaTagger</strong>
+                    <div className="settings-path-list">
+                      <label>
+                        <span>Version</span>
+                        <div>{appSettings?.appVersion || "Loading..."}</div>
+                      </label>
+                      <label>
+                        <span>App identifier</span>
+                        <div>{appSettings?.appIdentifier || "Loading..."}</div>
+                      </label>
+                    </div>
+                  </div>
+
+                  <div className="planner-section">
                     <strong>Library defaults</strong>
                     <div className="planner-grid">
                       <label>
@@ -3100,6 +3125,12 @@ function App() {
                         <span>Startup log</span>
                         <div>{appSettings?.startupLogPath || "Loading..."}</div>
                       </label>
+                    </div>
+                    <div className="detail-actions">
+                      <button onClick={openAppDataLocation} disabled={!appSettings}>
+                        <FolderOpen size={16} />
+                        Open app data location
+                      </button>
                     </div>
                   </div>
 
@@ -3643,7 +3674,7 @@ function App() {
                 ) : null}
 
                 {!duplicateReviewReadOnly ? (
-                <div className="planner-section duplicate-cleanup-panel">
+                <div className={`planner-section duplicate-cleanup-panel ${duplicateMovePanelOpen ? "open" : "collapsed"}`}>
                   <button
                     className="collapse-row"
                     onClick={() => setDuplicateMovePanelOpen((current) => !current)}
@@ -3652,37 +3683,40 @@ function App() {
                     <strong>Move to cleanup folder</strong>
                     {duplicateMovePanelOpen ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
                   </button>
-                  <div className="panel-note duplicate-preflight-note">
-                    <strong>Preflight summary</strong>
-                    <span>
-                      {activeMediaItem && duplicateItemIds.includes(activeMediaItem.id)
-                        ? `Keeping ${activeMediaItem.filename}`
-                        : "No keeper chosen yet"}
-                    </span>
-                    <span>
-                      {selectedDuplicateGlobalCount.toLocaleString()} cleanup item(s) selected
-                      {selectedDuplicateGlobalCount ? ` | ${formatFileSize(selectedDuplicateGlobalBytes)} estimated` : ""}
-                    </span>
-                    <span>
-                      {duplicateMovePanelOpen
-                        ? duplicateCleanupDestination
-                          ? `Move extras to ${duplicateCleanupDestination}`
-                          : "Choose a cleanup folder to move extras"
-                        : "Delete selected extras from disk or open move-to-cleanup options"}
-                    </span>
-                    {duplicateItems.length > 1 && selectedDuplicateCount === duplicateItems.length ? (
-                      <span className="duplicate-preflight-warning">
-                        All files in this duplicate group are selected right now. Choose a keeper before cleanup.
-                      </span>
-                    ) : null}
-                    {activeDuplicateIsSelected ? (
-                      <span className="duplicate-preflight-warning">
-                        The active file is included in the cleanup selection.
-                      </span>
-                    ) : null}
-                  </div>
+                  {!duplicateMovePanelOpen && selectedDuplicateGlobalCount ? (
+                    <div className="duplicate-compact-preflight">
+                      {selectedDuplicateGlobalCount.toLocaleString()} selected | {formatFileSize(selectedDuplicateGlobalBytes)} estimated
+                    </div>
+                  ) : null}
                   {duplicateMovePanelOpen && !duplicateReviewReadOnly ? (
                     <div className="duplicate-move-options">
+                      <div className="panel-note duplicate-preflight-note">
+                        <strong>Move preflight</strong>
+                        <span>
+                          {activeMediaItem && duplicateItemIds.includes(activeMediaItem.id)
+                            ? `Active file: ${activeMediaItem.filename}`
+                            : "No active duplicate item selected"}
+                        </span>
+                        <span>
+                          {selectedDuplicateGlobalCount.toLocaleString()} cleanup item(s) selected
+                          {selectedDuplicateGlobalCount ? ` | ${formatFileSize(selectedDuplicateGlobalBytes)} estimated` : ""}
+                        </span>
+                        <span>
+                          {duplicateCleanupDestination
+                            ? `Move selected files to ${duplicateCleanupDestination}`
+                            : "Choose a cleanup folder to move selected files"}
+                        </span>
+                        {fullySelectedDuplicateGroups.length ? (
+                          <span className="duplicate-preflight-warning">
+                            {fullySelectedDuplicateGroups.length.toLocaleString()} duplicate group(s) have every copy selected.
+                          </span>
+                        ) : null}
+                        {activeDuplicateIsSelected ? (
+                          <span className="duplicate-preflight-warning">
+                            The active file is included in the cleanup selection.
+                          </span>
+                        ) : null}
+                      </div>
                       <div className="planner-choice-list">
                         <label>
                           <input
@@ -3722,7 +3756,7 @@ function App() {
                       </label>
 
                       <div className="detail-actions">
-                        <button onClick={() => void runDuplicateCleanup("move")} disabled={!selectedDuplicateCount || isCleaningDuplicates}>
+                        <button onClick={() => void runDuplicateCleanup("move")} disabled={!selectedDuplicateGlobalCount || isCleaningDuplicates}>
                           <FolderOpen size={16} />
                           {isCleaningDuplicates ? "Running cleanup..." : "Move selected duplicates"}
                         </button>
@@ -4694,6 +4728,11 @@ function App() {
                 <span>
                   This will permanently remove the selected duplicate files from disk and mark them missing in the local scan cache.
                 </span>
+                {fullySelectedDuplicateGroups.length ? (
+                  <span className="duplicate-preflight-warning">
+                    Every copy is selected in {fullySelectedDuplicateGroups.length.toLocaleString()} duplicate group(s).
+                  </span>
+                ) : null}
               </div>
               <label className="duplicate-confirmation">
                 <input
