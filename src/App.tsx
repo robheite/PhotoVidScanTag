@@ -662,11 +662,11 @@ function App() {
   const libraryTableResizeRef = useRef<{ startY: number; startHeight: number } | null>(null);
   const scanTableResizeRef = useRef<{ startY: number; startHeight: number } | null>(null);
   const [panelSplitWidths, setPanelSplitWidths] = useState<Record<SplitSection, number>>({
-    Scan: 520,
-    Library: 520,
-    Duplicates: 420,
-    "Move/Copy": 460,
-    Settings: 520
+    Scan: 420,
+    Library: 420,
+    Duplicates: 360,
+    "Move/Copy": 400,
+    Settings: 420
   });
   const splitResizeRef = useRef<{ section: SplitSection; startX: number; startWidth: number } | null>(null);
   const previewWarmRunRef = useRef(0);

@@ -15,8 +15,8 @@
         "title": "MediaTagger",
         "width": 1320,
         "height": 860,
-        "minWidth": 1024,
-        "minHeight": 720,
+        "minWidth": 960,
+        "minHeight": 640,
         "resizable": true,
         "center": true
       }
