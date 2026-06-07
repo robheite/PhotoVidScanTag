@@ -279,6 +279,7 @@ button:disabled {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 6px;
+  contain: layout paint;
 }
 
 .metric {
@@ -311,6 +312,7 @@ button:disabled {
   min-height: 0;
   min-width: min(980px, 100%);
   flex: 1;
+  contain: layout;
   overflow: auto;
 }
 
@@ -336,6 +338,7 @@ button:disabled {
 .panel {
   min-width: 0;
   min-height: 0;
+  contain: layout paint;
   overflow: auto;
   border: 1px solid #d8d3c8;
   border-radius: 7px;
@@ -886,6 +889,7 @@ button:disabled {
 .duplicate-group-list {
   flex: 1;
   min-height: 120px;
+  contain: layout paint;
   overflow: auto;
   padding: 6px;
   border-bottom: 1px solid #ece8df;
@@ -1560,6 +1564,7 @@ button:disabled {
   flex: 1 1 0;
   min-height: 160px;
   padding: 8px;
+  contain: layout paint;
   overflow: auto;
   overscroll-behavior: contain;
 }
@@ -1659,6 +1664,7 @@ button:disabled {
   min-height: 160px;
   max-height: none;
   margin: 0 8px 8px;
+  contain: layout paint;
   overflow: auto;
   border: 1px solid #d8d3c8;
   border-radius: 8px;

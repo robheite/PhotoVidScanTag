@@ -28,7 +28,7 @@ import {
   Settings,
   Tags
 } from "lucide-react";
-import { memo, type ReactNode, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import { memo, startTransition, type ReactNode, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 
 const sections = [
   { label: "Scan", icon: ScanSearch, enabled: true },
@@ -247,6 +247,7 @@ type CleanupDuplicatesResponse = {
   renamedItems: number;
   skippedExisting: number;
   failedItems: number;
+  cleanedPaths: string[];
   errors: string[];
 };
 
@@ -2706,11 +2707,33 @@ function App() {
         }
       });
 
-      await initializeAppData();
+      const cleanedPathSet = new Set(result.cleanedPaths);
+      if (cleanedPathSet.size) {
+        setMediaFiles((currentFiles) =>
+          currentFiles.map((file) =>
+            cleanedPathSet.has(file.path)
+              ? { ...file, missing: true, scannedAtUnix: Math.floor(Date.now() / 1000) }
+              : file
+          )
+        );
+        setScanResult((currentResult) =>
+          currentResult
+            ? {
+                ...currentResult,
+                missingFiles: currentResult.missingFiles + cleanedPathSet.size
+              }
+            : currentResult
+        );
+      }
+      const [savedTags] = await Promise.all([
+        invoke<TagSummary[]>("list_tags"),
+        refreshOperationHistory()
+      ]).then(([nextTags]) => [nextTags] as const);
+      setTags(savedTags);
       setDuplicateGroups((currentGroups) => {
         const nextGroups = currentGroups
           .map((group) => {
-            const items = group.items.filter((item) => !selectedPathSet.has(item.path));
+            const items = group.items.filter((item) => !cleanedPathSet.has(item.path));
             const fileCount = items.length;
             const wastedSizeBytes = fileCount > 1 ? items.slice(1).reduce((total, item) => total + item.fileSizeBytes, 0) : 0;
             return {
@@ -2935,7 +2958,9 @@ function App() {
             : "Scan Defaults";
 
   function toggleSidePanel(section: AppSection = activeSection) {
-    setSidePanelCollapsed((current) => ({ ...current, [section]: !current[section] }));
+    startTransition(() => {
+      setSidePanelCollapsed((current) => ({ ...current, [section]: !current[section] }));
+    });
   }
 
   function renderDrawerTab(section: AppSection, label: string) {
@@ -3066,7 +3091,14 @@ function App() {
               {activeSidePanelOpen ? <ChevronLeft size={17} /> : <ChevronRight size={17} />}
               {activeSidePanelOpen ? "Hide panel" : "Show panel"}
             </button>
-            <button className="secondary-button" onClick={() => setSummaryCollapsed((collapsed) => !collapsed)}>
+            <button
+              className="secondary-button"
+              onClick={() => {
+                startTransition(() => {
+                  setSummaryCollapsed((collapsed) => !collapsed);
+                });
+              }}
+            >
               {summaryCollapsed ? <ChevronDown size={17} /> : <ChevronUp size={17} />}
               {summaryCollapsed ? "Show summary" : "Hide summary"}
             </button>

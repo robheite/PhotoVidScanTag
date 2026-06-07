@@ -276,6 +276,7 @@ struct CleanupDuplicatesResponse {
     renamed_items: usize,
     skipped_existing: usize,
     failed_items: usize,
+    cleaned_paths: Vec<String>,
     errors: Vec<String>,
 }
 
@@ -1102,6 +1103,7 @@ fn cleanup_duplicates(
         renamed_items: 0,
         skipped_existing: 0,
         failed_items: 0,
+        cleaned_paths: Vec::new(),
         errors: Vec::new(),
     };
 
@@ -1197,6 +1199,9 @@ fn cleanup_duplicates(
                     continue;
                 }
                 mark_media_file_missing(&conn, &source_path).map_err(|error| error.to_string())?;
+                response
+                    .cleaned_paths
+                    .push(source_path.to_string_lossy().to_string());
             }
             Err(error) => {
                 response.failed_items += 1;
