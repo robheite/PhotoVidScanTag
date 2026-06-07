@@ -206,6 +206,7 @@ struct DuplicateScanResponse {
     wasted_size_bytes: i64,
     wasted_size_mb: f64,
     hashed_files: usize,
+    skipped_inaccessible_files: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -214,6 +215,7 @@ struct DuplicateHashWarmResponse {
     candidates: usize,
     processed: usize,
     hashed_files: usize,
+    skipped_inaccessible_files: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1400,11 +1402,30 @@ fn find_duplicates_blocking(
 
     let mut grouped_file_ids: HashMap<(i64, String), Vec<i64>> = HashMap::new();
     let mut hashed_files = 0usize;
+    let mut skipped_inaccessible_files = 0usize;
 
     for (index, (file_id, path, file_size_bytes, stored_hash)) in candidates.into_iter().enumerate() {
         let hash = if stored_hash.is_empty() {
-            let computed = compute_file_hash(Path::new(&path))
-                .map_err(|error| format!("{path}: {error}"))?;
+            let computed = match compute_file_hash(Path::new(&path)) {
+                Ok(hash) => hash,
+                Err(error) => {
+                    skipped_inaccessible_files += 1;
+                    conn.execute(
+                        "UPDATE media_files
+                         SET missing = 1, scanned_at_unix = ?1
+                         WHERE id = ?2",
+                        params![unix_now(), file_id],
+                    )
+                    .map_err(|db_error| db_error.to_string())?;
+                    write_startup_log(&format!("duplicate hash skipped inaccessible file: {path}: {error}"));
+                    progress.processed = index + 1;
+                    progress.current_path = Some(path);
+                    if progress.processed % 100 == 0 || progress.processed == progress.candidates {
+                        emit_duplicate_progress(&app, &progress);
+                    }
+                    continue;
+                }
+            };
             conn.execute(
                 "UPDATE media_files
                  SET file_hash = ?1, hash_updated_at_unix = ?2
@@ -1489,15 +1510,20 @@ fn find_duplicates_blocking(
         wasted_size_bytes,
         wasted_size_mb: round_mb(wasted_size_bytes),
         hashed_files,
+        skipped_inaccessible_files,
     };
     let summary = if response.groups.is_empty() {
-        format!("Duplicate check finished: hashed {} files, no exact duplicates found", response.hashed_files)
+        format!(
+            "Duplicate check finished: hashed {} files, skipped {} inaccessible files, no exact duplicates found",
+            response.hashed_files, response.skipped_inaccessible_files
+        )
     } else {
         format!(
-            "Duplicate check finished: {} groups across {} files, {:.1} MB reclaimable",
+            "Duplicate check finished: {} groups across {} files, {:.1} MB reclaimable, skipped {} inaccessible files",
             response.groups.len(),
             response.duplicate_files,
-            response.wasted_size_mb
+            response.wasted_size_mb,
+            response.skipped_inaccessible_files
         )
     };
     record_operation(&conn, "duplicate_scan", "success", &summary, None)
@@ -1781,6 +1807,7 @@ fn find_probable_duplicates_blocking(
         wasted_size_bytes,
         wasted_size_mb: round_mb(wasted_size_bytes),
         hashed_files: 0,
+        skipped_inaccessible_files: 0,
     };
 
     let summary = if response.groups.is_empty() {
@@ -1847,8 +1874,28 @@ fn warm_duplicate_hashes_blocking(
     emit_duplicate_progress(&app, &progress);
 
     let mut hashed_files = 0usize;
+    let mut skipped_inaccessible_files = 0usize;
     for (index, (file_id, path)) in candidates.into_iter().enumerate() {
-        let computed = compute_file_hash(Path::new(&path)).map_err(|error| format!("{path}: {error}"))?;
+        let computed = match compute_file_hash(Path::new(&path)) {
+            Ok(hash) => hash,
+            Err(error) => {
+                skipped_inaccessible_files += 1;
+                conn.execute(
+                    "UPDATE media_files
+                     SET missing = 1, scanned_at_unix = ?1
+                     WHERE id = ?2",
+                    params![unix_now(), file_id],
+                )
+                .map_err(|db_error| db_error.to_string())?;
+                write_startup_log(&format!("duplicate hash warm-up skipped inaccessible file: {path}: {error}"));
+                progress.processed = index + 1;
+                progress.current_path = Some(path);
+                if progress.processed % 100 == 0 || progress.processed == progress.candidates {
+                    emit_duplicate_progress(&app, &progress);
+                }
+                continue;
+            }
+        };
         conn.execute(
             "UPDATE media_files
              SET file_hash = ?1, hash_updated_at_unix = ?2
@@ -1870,14 +1917,15 @@ fn warm_duplicate_hashes_blocking(
         candidates: progress.candidates,
         processed: progress.processed,
         hashed_files,
+        skipped_inaccessible_files,
     };
 
     let summary = if response.candidates == 0 {
         "Duplicate hash warm-up found no pending candidates".to_string()
     } else {
         format!(
-            "Duplicate hash warm-up finished: {} hashed across {} candidate files",
-            response.hashed_files, response.candidates
+            "Duplicate hash warm-up finished: {} hashed across {} candidate files, skipped {} inaccessible files",
+            response.hashed_files, response.candidates, response.skipped_inaccessible_files
         )
     };
     record_operation(&conn, "duplicate_hash_warm", "success", &summary, None)

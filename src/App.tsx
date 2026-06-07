@@ -192,12 +192,14 @@ type DuplicateScanResponse = {
   wastedSizeBytes: number;
   wastedSizeMb: number;
   hashedFiles: number;
+  skippedInaccessibleFiles: number;
 };
 
 type DuplicateHashWarmResponse = {
   candidates: number;
   processed: number;
   hashedFiles: number;
+  skippedInaccessibleFiles: number;
 };
 
 type MovePreviewItem = {
@@ -2378,17 +2380,26 @@ function App() {
       setActiveDuplicateGroupKey(result.groups[0]?.key ?? null);
       setSelectedFileIds([]);
       setDuplicateCleanupConfirmed(false);
-      await refreshOperationHistory();
+      const [files, savedTags] = await Promise.all([
+        invoke<MediaFile[]>("list_media"),
+        invoke<TagSummary[]>("list_tags"),
+        refreshOperationHistory()
+      ]).then(([nextFiles, nextTags]) => [nextFiles, nextTags] as const);
+      setMediaFiles(files);
+      setTags(savedTags);
+      const skippedSuffix = result.skippedInaccessibleFiles
+        ? `, skipped ${result.skippedInaccessibleFiles.toLocaleString()} inaccessible cached file(s)`
+        : "";
       setStatus(
         result.groups.length
           ? `${
               duplicateMatchMode === "exact" ? "Found" : "Reviewed"
             } ${result.groups.length.toLocaleString()} ${
               duplicateMatchMode === "exact" ? "duplicate" : "probable duplicate"
-            } groups across ${result.duplicateFiles.toLocaleString()} files`
+            } groups across ${result.duplicateFiles.toLocaleString()} files${skippedSuffix}`
           : duplicateMatchMode === "exact"
-            ? "No exact duplicates found"
-            : "No probable duplicate groups found"
+            ? `No exact duplicates found${skippedSuffix}`
+            : `No probable duplicate groups found${skippedSuffix}`
       );
     } catch (error) {
       setStatus(
@@ -2407,9 +2418,12 @@ function App() {
     try {
       const result = await invoke<DuplicateHashWarmResponse>("warm_duplicate_hashes");
       await refreshOperationHistory();
+      const skippedSuffix = result.skippedInaccessibleFiles
+        ? `, skipped ${result.skippedInaccessibleFiles.toLocaleString()} inaccessible cached file(s)`
+        : "";
       setStatus(
         result.candidates
-          ? `Duplicate hash warm-up finished: ${result.hashedFiles.toLocaleString()} hashed across ${result.candidates.toLocaleString()} candidate file(s)`
+          ? `Duplicate hash warm-up finished: ${result.hashedFiles.toLocaleString()} hashed across ${result.candidates.toLocaleString()} candidate file(s)${skippedSuffix}`
           : "Duplicate hash warm-up found no pending candidates"
       );
     } catch (error) {
@@ -4666,7 +4680,7 @@ function App() {
         <footer className="status-bar" aria-live="polite">
           <div className="status-primary">
             <span className={`status-dot ${isBusy ? "active" : ""}`} />
-            <strong>{status}</strong>
+            <strong title={status}>{status}</strong>
           </div>
           <div className="status-details">
             <span>
