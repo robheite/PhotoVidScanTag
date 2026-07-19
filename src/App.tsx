@@ -419,10 +419,11 @@ function VirtualDataGrid<T>({
   columnWidths,
   items,
   rowClassName,
-  rowHeight = 38,
+  rowHeight = 52,
   emptyMessage,
   getRowKey,
   getRowClassName,
+  getRowSelected,
   renderCells,
   onRowClick,
   onBeginResize
@@ -436,6 +437,7 @@ function VirtualDataGrid<T>({
   emptyMessage: string;
   getRowKey: (item: T, index: number) => string;
   getRowClassName?: (item: T, index: number) => string;
+  getRowSelected?: (item: T, index: number) => boolean;
   renderCells: (item: T, index: number) => ReactNode[];
   onRowClick?: (item: T, index: number) => void;
   onBeginResize: (set: GridColumnSet, index: number, clientX: number) => void;
@@ -481,8 +483,16 @@ function VirtualDataGrid<T>({
               <div
                 className={`data-grid-row ${rowClassName ?? ""} ${getRowClassName?.(item, itemIndex) ?? ""}`.trim()}
                 role="row"
+                tabIndex={onRowClick ? 0 : undefined}
+                aria-selected={getRowSelected?.(item, itemIndex)}
                 key={getRowKey(item, itemIndex)}
                 onClick={onRowClick ? () => onRowClick(item, itemIndex) : undefined}
+                onKeyDown={onRowClick ? (event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    onRowClick(item, itemIndex);
+                  }
+                } : undefined}
                 style={{
                   gridTemplateColumns: template,
                   minWidth: gridWidth,
@@ -557,6 +567,8 @@ function VirtualMediaGrid<T>({
   return (
     <div
       className={`media-grid virtualized-media-grid ${className ?? ""}`.trim()}
+      role="listbox"
+      aria-multiselectable="true"
       ref={containerRef}
       onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
     >
@@ -642,6 +654,7 @@ function VirtualDuplicateGroupList({
             return (
               <button
                 className={`duplicate-group-card ${activeGroupKey === group.key ? "active" : ""}`}
+                aria-pressed={activeGroupKey === group.key}
                 key={group.key}
                 onClick={() => onSelectGroup(group)}
                 style={{ top: itemIndex * rowHeight, height: rowHeight - 7 }}
@@ -721,7 +734,7 @@ function App() {
   const [thumbnailSize, setThumbnailSize] = useState<ThumbnailSize>("medium");
   const [libraryPageSize, setLibraryPageSize] = useState<number>(50);
   const [libraryPage, setLibraryPage] = useState<number>(1);
-  const [libraryTableOpen, setLibraryTableOpen] = useState(true);
+  const [libraryTableOpen, setLibraryTableOpen] = useState(false);
   const [libraryTableHeight, setLibraryTableHeight] = useState<number>(320);
   const [scanTableHeight, setScanTableHeight] = useState<number>(320);
   const [activeMediaId, setActiveMediaId] = useState<number | null>(null);
@@ -764,11 +777,11 @@ function App() {
   const libraryTableResizeRef = useRef<{ startY: number; startHeight: number } | null>(null);
   const scanTableResizeRef = useRef<{ startY: number; startHeight: number } | null>(null);
   const [panelSplitWidths, setPanelSplitWidths] = useState<Record<SplitSection, number>>({
-    Scan: 420,
-    Library: 420,
-    Duplicates: 360,
-    "Move/Copy": 400,
-    Settings: 420
+    Scan: 320,
+    Library: 320,
+    Duplicates: 320,
+    "Move/Copy": 340,
+    Settings: 360
   });
   const splitResizeRef = useRef<{ section: SplitSection; startX: number; startWidth: number } | null>(null);
   const previewWarmRunRef = useRef(0);
@@ -778,10 +791,26 @@ function App() {
     move: [220, 240, 360, 420]
   });
   const gridResizeRef = useRef<{ set: GridColumnSet; index: number; startX: number; startWidth: number } | null>(null);
+  const magnifyDialogRef = useRef<HTMLDivElement | null>(null);
+  const deleteDialogRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     void initializeAppData();
   }, []);
+
+  useEffect(() => {
+    setMovePreviewItems([]);
+  }, [
+    moveScope,
+    moveMode,
+    moveCollisionPolicy,
+    moveDestination,
+    moveLevelOne,
+    moveLevelTwo,
+    moveLevelThree,
+    moveLevelFour,
+    moveSelectedFolderPaths
+  ]);
 
   useEffect(() => {
     let active = true;
@@ -1232,6 +1261,22 @@ function App() {
         selectedFileIdSet.has(item.id) ? "selected" : ""
       } ${activeMediaItem?.id === item.id ? "active-item" : ""}`}
       onClick={() => activateMediaFile(item.id)}
+      role="option"
+      tabIndex={0}
+      aria-selected={selectedFileIdSet.has(item.id)}
+      aria-label={`${item.filename}, ${item.extension.toUpperCase()}${item.missing ? ", missing" : ""}`}
+      onKeyDown={(event) => {
+        if (event.target !== event.currentTarget) {
+          return;
+        }
+        if (event.key === "Enter") {
+          event.preventDefault();
+          activateMediaFile(item.id);
+        } else if (event.key === " ") {
+          event.preventDefault();
+          toggleFileSelection(item.id);
+        }
+      }}
       onDoubleClick={() => {
         if (activeSection === "Library" && !item.missing) {
           setMagnifiedMediaId(item.id);
@@ -1292,19 +1337,46 @@ function App() {
   }, [magnifiedMediaId, magnifiedMediaItem]);
 
   useEffect(() => {
-    if (!magnifiedMediaItem) {
+    const dialog = deleteDuplicateConfirmOpen ? deleteDialogRef.current : magnifiedMediaItem ? magnifyDialogRef.current : null;
+    if (!dialog) {
       return;
     }
 
+    const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    requestAnimationFrame(() => dialog.querySelector<HTMLElement>("button, input, [tabindex]:not([tabindex='-1'])")?.focus());
+
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
-        setMagnifiedMediaId(null);
+        event.preventDefault();
+        if (deleteDuplicateConfirmOpen) {
+          setDeleteDuplicateConfirmOpen(false);
+        } else {
+          setMagnifiedMediaId(null);
+        }
+        return;
+      }
+
+      if (event.key === "Tab") {
+        const focusable = Array.from(dialog.querySelectorAll<HTMLElement>("button:not(:disabled), input:not(:disabled), [tabindex]:not([tabindex='-1'])"));
+        if (!focusable.length) return;
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first.focus();
+        }
       }
     };
 
     window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [magnifiedMediaItem]);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      previouslyFocused?.focus();
+    };
+  }, [deleteDuplicateConfirmOpen, magnifiedMediaItem]);
 
   useEffect(() => {
     if (!filteredDuplicateGroups.length) {
@@ -2491,6 +2563,16 @@ function App() {
       return;
     }
 
+    if (
+      moveMode === "move" &&
+      !window.confirm(
+        `Move ${movePreviewItems.length.toLocaleString()} file(s) to ${moveDestination}? Source files will be removed after each successful move.`
+      )
+    ) {
+      setStatus("Move cancelled; the preview is still available for review");
+      return;
+    }
+
     cancelPreviewWarmup();
     const plannedItems = movePreviewItems.map((item) => ({ ...item }));
     setIsExecutingMoveCopy(true);
@@ -2580,6 +2662,23 @@ function App() {
     } finally {
       setIsFindingDuplicates(false);
     }
+  }
+
+  function changeDuplicateMatchMode(mode: DuplicateMatchMode) {
+    if (mode === duplicateMatchMode) {
+      return;
+    }
+    if (
+      (duplicateGroups.length || selectedFileIds.length) &&
+      !window.confirm("Switch duplicate modes? Current duplicate results and cleanup selections will be cleared.")
+    ) {
+      return;
+    }
+    setDuplicateMatchMode(mode);
+    setDuplicateGroups([]);
+    setDuplicateScanResult(null);
+    setActiveDuplicateGroupKey(null);
+    setSelectedFileIds([]);
   }
 
   async function warmDuplicateHashes() {
@@ -3080,6 +3179,8 @@ function App() {
             return (
               <button
                 className={isActive ? "active" : ""}
+                aria-current={isActive ? "page" : undefined}
+                aria-label={section.label}
                 disabled={!section.enabled}
                 title={section.enabled ? undefined : "This section is not built yet."}
                 key={section.label}
@@ -3096,13 +3197,14 @@ function App() {
           })}
         </nav>
 
-        <div className="sidebar-block">
+        {activeSection === "Library" ? <div className="sidebar-block">
           <div className="block-title">
             <Tags size={16} />
             Tags
           </div>
           <button
             className={`tag-row ${selectedTagFilter === null ? "active-filter" : ""}`}
+            aria-pressed={selectedTagFilter === null}
             onClick={() => setSelectedTagFilter(null)}
           >
             <span>All files</span>
@@ -3112,6 +3214,7 @@ function App() {
             tags.map((tag) => (
               <button
                 className={`tag-row ${selectedTagFilter === tag.name ? "active-filter" : ""}`}
+                aria-pressed={selectedTagFilter === tag.name}
                 key={tag.id}
                 onClick={() => setSelectedTagFilter(tag.name)}
               >
@@ -3125,9 +3228,9 @@ function App() {
               <small>0</small>
             </button>
           )}
-        </div>
+        </div> : null}
 
-        <div className="sidebar-block">
+        {activeSection === "Library" ? <div className="sidebar-block">
           <div className="block-title">
             <Copy size={16} />
             Tag Report
@@ -3143,7 +3246,7 @@ function App() {
             <Copy size={16} />
             Export CSV
           </button>
-        </div>
+        </div> : null}
       </aside>
 
       <div className="resize-rail" aria-hidden="true" />
@@ -3167,12 +3270,13 @@ function App() {
             </p>
           </div>
           <div className="topbar-actions">
-            <button className="secondary-button" onClick={() => toggleSidePanel()} title={`${activeSidePanelOpen ? "Hide" : "Show"} ${activeSidePanelLabel}`}>
+            <button className="secondary-button" aria-pressed={activeSidePanelOpen} onClick={() => toggleSidePanel()} title={`${activeSidePanelOpen ? "Hide" : "Show"} ${activeSidePanelLabel}`}>
               {activeSidePanelOpen ? <ChevronLeft size={17} /> : <ChevronRight size={17} />}
               {activeSidePanelOpen ? "Hide panel" : "Show panel"}
             </button>
             <button
               className="secondary-button"
+              aria-pressed={!summaryCollapsed}
               onClick={() => {
                 startTransition(() => {
                   setSummaryCollapsed((collapsed) => !collapsed);
@@ -3352,7 +3456,12 @@ function App() {
                 </div>
               </section>
 
-              <div className="resize-rail subtle" aria-hidden="true" onMouseDown={(event) => beginSplitResize("Settings", event.clientX)} />
+              <div className="resize-rail subtle" role="separator" tabIndex={0} aria-label="Resize scan defaults panel" aria-orientation="vertical" aria-valuemin={300} aria-valuemax={860} aria-valuenow={panelSplitWidths.Settings} onKeyDown={(event) => {
+                if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+                  event.preventDefault();
+                  setPanelSplitWidths((current) => ({ ...current, Settings: Math.min(860, Math.max(300, current.Settings + (event.key === "ArrowRight" ? 16 : -16))) }));
+                }
+              }} onMouseDown={(event) => beginSplitResize("Settings", event.clientX)} />
               </>
               ) : (
                 renderDrawerTab("Settings", "Scan Defaults")
@@ -3737,7 +3846,12 @@ function App() {
                 </section>
               </div>
 
-              <div className="resize-rail subtle" aria-hidden="true" onMouseDown={(event) => beginSplitResize("Move/Copy", event.clientX)} />
+              <div className="resize-rail subtle" role="separator" tabIndex={0} aria-label="Resize plan setup panel" aria-orientation="vertical" aria-valuemin={300} aria-valuemax={860} aria-valuenow={panelSplitWidths["Move/Copy"]} onKeyDown={(event) => {
+                if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+                  event.preventDefault();
+                  setPanelSplitWidths((current) => ({ ...current, "Move/Copy": Math.min(860, Math.max(300, current["Move/Copy"] + (event.key === "ArrowRight" ? 16 : -16))) }));
+                }
+              }} onMouseDown={(event) => beginSplitResize("Move/Copy", event.clientX)} />
               </>
               ) : (
                 renderDrawerTab("Move/Copy", "Plan Setup")
@@ -3801,8 +3915,8 @@ function App() {
                   renderCells={(item) => [
                     <span key="name">{item.filename}</span>,
                     <span key="action">{item.reason}</span>,
-                    <span key="source">{item.sourcePath}</span>,
-                    <span key="destination">{item.destinationPath}</span>
+                    <span className="path-cell" title={item.sourcePath} key="source">{item.sourcePath}</span>,
+                    <span className="path-cell" title={item.destinationPath} key="destination">{item.destinationPath}</span>
                   ]}
                   onBeginResize={beginGridColumnResize}
                 />
@@ -3844,7 +3958,12 @@ function App() {
                 />
               </section>
 
-              <div className="resize-rail subtle" aria-hidden="true" onMouseDown={(event) => beginSplitResize("Duplicates", event.clientX)} />
+              <div className="resize-rail subtle" role="separator" tabIndex={0} aria-label="Resize duplicate groups panel" aria-orientation="vertical" aria-valuemin={300} aria-valuemax={860} aria-valuenow={panelSplitWidths.Duplicates} onKeyDown={(event) => {
+                if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+                  event.preventDefault();
+                  setPanelSplitWidths((current) => ({ ...current, Duplicates: Math.min(860, Math.max(300, current.Duplicates + (event.key === "ArrowRight" ? 16 : -16))) }));
+                }
+              }} onMouseDown={(event) => beginSplitResize("Duplicates", event.clientX)} />
               </>
               ) : (
                 renderDrawerTab("Duplicates", "Duplicate Groups")
@@ -3879,6 +3998,7 @@ function App() {
                     </div>
                     <button
                       className="icon-button"
+                      aria-pressed={detailPanelOpen}
                       aria-label={detailPanelOpen ? "Hide details panel" : "Show details panel"}
                       title={detailPanelOpen ? "Hide details panel" : "Show details panel"}
                       onClick={() => setDetailPanelOpen((open) => !open)}
@@ -3891,26 +4011,16 @@ function App() {
                 <div className="planner-toggle duplicate-mode-toggle">
                   <button
                     className={duplicateMatchMode === "exact" ? "active" : ""}
-                    onClick={() => {
-                      setDuplicateMatchMode("exact");
-                      setDuplicateGroups([]);
-                      setDuplicateScanResult(null);
-                      setActiveDuplicateGroupKey(null);
-                      setSelectedFileIds([]);
-                    }}
+                    aria-pressed={duplicateMatchMode === "exact"}
+                    onClick={() => changeDuplicateMatchMode("exact")}
                     disabled={isFindingDuplicates || isCleaningDuplicates}
                   >
                     Exact
                   </button>
                   <button
                     className={duplicateMatchMode === "probable" ? "active" : ""}
-                    onClick={() => {
-                      setDuplicateMatchMode("probable");
-                      setDuplicateGroups([]);
-                      setDuplicateScanResult(null);
-                      setActiveDuplicateGroupKey(null);
-                      setSelectedFileIds([]);
-                    }}
+                    aria-pressed={duplicateMatchMode === "probable"}
+                    onClick={() => changeDuplicateMatchMode("probable")}
                     disabled={isFindingDuplicates || isCleaningDuplicates}
                   >
                     Probable
@@ -3933,14 +4043,17 @@ function App() {
                 </div>
 
                 <div className="toolbar duplicate-selection-toolbar">
+                  <strong className="duplicate-selection-count">
+                    {selectedDuplicateGlobalCount.toLocaleString()} cleanup candidate{selectedDuplicateGlobalCount === 1 ? "" : "s"}
+                  </strong>
                   <button onClick={selectDuplicateGroup} disabled={!duplicateItems.length}>
                     Select group
                   </button>
                   <button onClick={keepActiveDuplicate} disabled={duplicateReviewReadOnly || !duplicateItems.length || !activeMediaItem}>
-                    Keep active
+                    Mark active as keeper
                   </button>
-                  <button onClick={keepActiveAndPrepareCleanup} disabled={duplicateReviewReadOnly || !duplicateItems.length || !activeMediaItem}>
-                    Keep active, clean rest
+                  <button className="keeper-primary" onClick={keepActiveAndPrepareCleanup} disabled={duplicateReviewReadOnly || !duplicateItems.length || !activeMediaItem}>
+                    Keep active; select other copies
                   </button>
                   <button onClick={sendDuplicateSelectionToMoveCopy} disabled={duplicateReviewReadOnly || !selectedDuplicateGlobalCount}>
                     <MoveRight size={16} />
@@ -3953,9 +4066,6 @@ function App() {
                   <button onClick={clearDuplicateGroupSelection} disabled={!selectedDuplicateCount}>
                     Clear group
                   </button>
-                  <span className="duplicate-selection-note">
-                    {selectedDuplicateGlobalCount.toLocaleString()} selected across duplicate groups
-                  </span>
                 </div>
 
                 {duplicateReviewReadOnly ? (
@@ -4097,6 +4207,7 @@ function App() {
                       }
                       getRowKey={(item) => `${item.path}-duplicate-row`}
                       getRowClassName={(item) => (selectedFileIdSet.has(item.id) ? "selected" : "")}
+                      getRowSelected={(item) => selectedFileIdSet.has(item.id)}
                       onRowClick={(item) => activateMediaFile(item.id)}
                       renderCells={(item) => [
                         <span key="select">
@@ -4112,7 +4223,7 @@ function App() {
                         <span key="type">{item.extension.toUpperCase()}</span>,
                         <span key="size">{formatFileSize(item.fileSizeBytes)}</span>,
                         <span key="date">{formatDate(item.dateTakenUnix)}</span>,
-                        <span key="path">{item.path}</span>,
+                        <span className="path-cell" title={item.path} key="path">{item.path}</span>,
                         <span key="tags">{item.tags.join(", ") || "No tags"}</span>
                       ]}
                       onBeginResize={beginGridColumnResize}
@@ -4122,7 +4233,19 @@ function App() {
                   {detailPanelOpen ? (
                     <div
                       className="detail-resize-rail"
+                      role="separator"
+                      tabIndex={0}
                       aria-label="Resize details panel"
+                      aria-orientation="vertical"
+                      aria-valuemin={260}
+                      aria-valuemax={560}
+                      aria-valuenow={detailPanelWidth}
+                      onKeyDown={(event) => {
+                        if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+                          event.preventDefault();
+                          setDetailPanelWidth((current) => Math.min(560, Math.max(260, current + (event.key === "ArrowLeft" ? 16 : -16))));
+                        }
+                      }}
                       onMouseDown={(event) => beginDetailResize(event.clientX)}
                     />
                   ) : null}
@@ -4484,7 +4607,20 @@ function App() {
 
           <div
             className="resize-rail subtle"
-            aria-hidden="true"
+            role="separator"
+            tabIndex={0}
+            aria-label={`Resize ${activeSection === "Library" ? "library folders" : "scan locations"} panel`}
+            aria-orientation="vertical"
+            aria-valuemin={300}
+            aria-valuemax={860}
+            aria-valuenow={panelSplitWidths[activeSection === "Library" ? "Library" : "Scan"]}
+            onKeyDown={(event) => {
+              if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+                event.preventDefault();
+                const section = activeSection === "Library" ? "Library" : "Scan";
+                setPanelSplitWidths((current) => ({ ...current, [section]: Math.min(860, Math.max(300, current[section] + (event.key === "ArrowRight" ? 16 : -16))) }));
+              }
+            }}
             onMouseDown={(event) => beginSplitResize(activeSection === "Library" ? "Library" : "Scan", event.clientX)}
           />
           </>
@@ -4506,13 +4642,20 @@ function App() {
                 </p>
               </div>
               <div className="view-actions">
-                <button className="icon-button" aria-label="Grid view" title="Grid view">
+                <button
+                  className={`icon-button ${activeSection === "Library" && !libraryTableOpen ? "active" : ""}`}
+                  aria-label="Grid view"
+                  aria-pressed={activeSection === "Library" ? !libraryTableOpen : true}
+                  title="Grid view"
+                  onClick={activeSection === "Library" ? () => setLibraryTableOpen(false) : undefined}
+                >
                   <Grid3X3 size={18} />
                 </button>
                 <div className="size-toggle" aria-label="Thumbnail size">
                   {thumbnailSizes.map((size) => (
                     <button
                       className={thumbnailSize === size ? "active" : ""}
+                      aria-pressed={thumbnailSize === size}
                       key={size}
                       onClick={() => setThumbnailSize(size)}
                     >
@@ -4520,12 +4663,20 @@ function App() {
                     </button>
                   ))}
                 </div>
-                <button className="icon-button" aria-label="Detailed list" disabled title="View toggle is not built yet.">
+                <button
+                  className={`icon-button ${activeSection === "Library" && libraryTableOpen ? "active" : ""}`}
+                  aria-label="Detailed list"
+                  aria-pressed={activeSection === "Library" ? libraryTableOpen : false}
+                  disabled={activeSection !== "Library"}
+                  title={activeSection === "Library" ? "Detailed list" : "Detailed list is available in Library"}
+                  onClick={activeSection === "Library" ? () => setLibraryTableOpen(true) : undefined}
+                >
                   <ListFilter size={18} />
                 </button>
                 {activeSection === "Library" ? (
                   <button
                     className="icon-button"
+                    aria-pressed={detailPanelOpen}
                     aria-label={detailPanelOpen ? "Hide details panel" : "Show details panel"}
                     title={detailPanelOpen ? "Hide details panel" : "Show details panel"}
                     onClick={() => setDetailPanelOpen((open) => !open)}
@@ -4536,7 +4687,7 @@ function App() {
               </div>
             </div>
 
-            <div className="filter-row">
+            <div className="filter-row library-search-row">
               <label>
                 <Search size={16} />
                 <input
@@ -4545,6 +4696,13 @@ function App() {
                   onChange={(event) => setSearchText(event.target.value)}
                 />
               </label>
+              <button onClick={() => setShowAdvancedFilters((current) => !current)} aria-expanded={showAdvancedFilters}>
+                <Filter size={16} />
+                {showAdvancedFilters ? "Hide filters" : "Filters"}
+              </button>
+            </div>
+            <div className="selection-action-bar" aria-label="Selection actions">
+              <strong>{selectedFileIds.length.toLocaleString()} selected</strong>
               <label className="tag-input">
                 <Tags size={16} />
                 <input
@@ -4564,13 +4722,9 @@ function App() {
                   <option value={tag.name} key={tag.id} />
                 ))}
               </datalist>
-              <button onClick={applyTagsToSelection}>
+              <button onClick={applyTagsToSelection} disabled={!selectedFileIds.length || !tagInput.trim()}>
                 <Tags size={16} />
                 Apply tag
-              </button>
-              <button onClick={() => setShowAdvancedFilters((current) => !current)}>
-                <Filter size={16} />
-                {showAdvancedFilters ? "Hide filters" : "Filters"}
               </button>
               <button onClick={selectVisibleFiles} disabled={!visibleMediaFiles.some((item) => !item.missing)}>
                 Select visible
@@ -4736,7 +4890,7 @@ function App() {
               }
             >
               <div className="library-main">
-                    <VirtualMediaGrid
+                    {activeSection !== "Library" || !libraryTableOpen ? <VirtualMediaGrid
                       items={activePreviewFiles}
                       width={activeThumbnailDimensions.width}
                       height={activeThumbnailDimensions.height}
@@ -4744,7 +4898,7 @@ function App() {
                       emptyMessage="No media files found yet. Add a path and start a scan."
                       getItemKey={(item) => item.path}
                       renderItem={(item) => renderSelectableMediaCard(item)}
-                    />
+                    /> : null}
                 {activeSection === "Scan" && visibleMediaFiles.length > previewMediaFiles.length ? (
                   <div className="preview-limit">
                     Showing first {previewMediaFiles.length} previews here. Open Library to browse all {visibleMediaFiles.length.toLocaleString()} visible files.
@@ -4771,7 +4925,7 @@ function App() {
                     </div>
                     <div className="page-nav">
                       <button onClick={() => setLibraryTableOpen((current) => !current)}>
-                        {libraryTableOpen ? "Hide file list" : "Show file list"}
+                        Switch to {libraryTableOpen ? "grid" : "list"}
                       </button>
                       <button onClick={() => setLibraryPage((current) => Math.max(1, current - 1))} disabled={clampedLibraryPage === 1}>
                         <ChevronLeft size={16} />
@@ -4808,13 +4962,37 @@ function App() {
                     {activeSection === "Library" ? (
                       <div
                         className="library-table-resize-rail"
+                        role="separator"
+                        tabIndex={0}
                         aria-label="Resize file list panel"
+                        aria-orientation="horizontal"
+                        aria-valuemin={160}
+                        aria-valuemax={640}
+                        aria-valuenow={libraryTableHeight}
+                        onKeyDown={(event) => {
+                          if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+                            event.preventDefault();
+                            setLibraryTableHeight((current) => Math.min(640, Math.max(160, current + (event.key === "ArrowUp" ? 16 : -16))));
+                          }
+                        }}
                         onMouseDown={(event) => beginLibraryTableResize(event.clientY)}
                       />
                     ) : activeSection === "Scan" ? (
                       <div
                         className="scan-table-resize-rail"
+                        role="separator"
+                        tabIndex={0}
                         aria-label="Resize scan file list panel"
+                        aria-orientation="horizontal"
+                        aria-valuemin={160}
+                        aria-valuemax={640}
+                        aria-valuenow={scanTableHeight}
+                        onKeyDown={(event) => {
+                          if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+                            event.preventDefault();
+                            setScanTableHeight((current) => Math.min(640, Math.max(160, current + (event.key === "ArrowUp" ? 16 : -16))));
+                          }
+                        }}
                         onMouseDown={(event) => beginScanTableResize(event.clientY)}
                       />
                     ) : null}
@@ -4842,6 +5020,7 @@ function App() {
                         emptyMessage="No media files found yet. Add a path and start a scan."
                         getRowKey={(item) => `${item.path}-row`}
                         getRowClassName={(item) => (selectedFileIdSet.has(item.id) ? "selected" : "")}
+                        getRowSelected={(item) => selectedFileIdSet.has(item.id)}
                         onRowClick={(item) => activateMediaFile(item.id)}
                         renderCells={(item) => [
                           <span key="select">
@@ -4857,7 +5036,7 @@ function App() {
                           <span key="type">{item.extension.toUpperCase()}</span>,
                         <span key="size">{formatFileSize(item.fileSizeBytes)}</span>,
                           <span key="date">{formatDate(item.dateTakenUnix)}</span>,
-                          <span key="path">{item.path}</span>
+                          <span className="path-cell" title={item.path} key="path">{item.path}</span>
                         ]}
                         onBeginResize={beginGridColumnResize}
                       />
@@ -4868,7 +5047,19 @@ function App() {
               {activeSection === "Library" && detailPanelOpen ? (
                 <div
                   className="detail-resize-rail"
+                  role="separator"
+                  tabIndex={0}
                   aria-label="Resize details panel"
+                  aria-orientation="vertical"
+                  aria-valuemin={260}
+                  aria-valuemax={560}
+                  aria-valuenow={detailPanelWidth}
+                  onKeyDown={(event) => {
+                    if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+                      event.preventDefault();
+                      setDetailPanelWidth((current) => Math.min(560, Math.max(260, current + (event.key === "ArrowLeft" ? 16 : -16))));
+                    }
+                  }}
                   onMouseDown={(event) => beginDetailResize(event.clientX)}
                 />
               ) : null}
@@ -5024,10 +5215,17 @@ function App() {
         </footer>
         {magnifiedMediaItem ? (
           <div className="magnify-overlay" onClick={() => setMagnifiedMediaId(null)}>
-            <div className="magnify-dialog" onClick={(event) => event.stopPropagation()}>
+            <div
+              className="magnify-dialog"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="magnify-dialog-title"
+              ref={magnifyDialogRef}
+              onClick={(event) => event.stopPropagation()}
+            >
               <div className="magnify-header">
                 <div>
-                  <strong>{magnifiedMediaItem.filename}</strong>
+                  <strong id="magnify-dialog-title">{magnifiedMediaItem.filename}</strong>
                   <span>{magnifiedMediaItem.path}</span>
                 </div>
                 <button onClick={() => setMagnifiedMediaId(null)}>Close</button>
@@ -5040,10 +5238,18 @@ function App() {
         ) : null}
         {deleteDuplicateConfirmOpen ? (
           <div className="magnify-overlay" onClick={() => setDeleteDuplicateConfirmOpen(false)}>
-            <div className="confirm-dialog" onClick={(event) => event.stopPropagation()}>
+            <div
+              className="confirm-dialog"
+              role="alertdialog"
+              aria-modal="true"
+              aria-labelledby="delete-duplicates-title"
+              aria-describedby="delete-duplicates-description"
+              ref={deleteDialogRef}
+              onClick={(event) => event.stopPropagation()}
+            >
               <div className="confirm-dialog-header">
-                <strong>Delete selected duplicates?</strong>
-                <span>
+                <strong id="delete-duplicates-title">Delete selected duplicates?</strong>
+                <span id="delete-duplicates-description">
                   This will permanently remove the selected duplicate files from disk and mark them missing in the local scan cache.
                 </span>
                 {fullySelectedDuplicateGroupCount ? (
@@ -5208,7 +5414,9 @@ function csvEscape(value: string) {
 }
 
 function buildGridTemplate(widths: number[]) {
-  return widths.map((width) => `minmax(0, ${width}px)`).join(" ");
+  return widths
+    .map((width, index) => index === widths.length - 1 ? `minmax(${width}px, 1fr)` : `minmax(0, ${width}px)`)
+    .join(" ");
 }
 
 function renderGridHeader(
@@ -5231,7 +5439,20 @@ function renderGridHeader(
           {index < labels.length - 1 ? (
             <button
               className="column-resize-handle"
+              role="separator"
+              aria-orientation="vertical"
+              aria-valuemin={60}
+              aria-valuenow={widths[index]}
               aria-label={`Resize ${label} column`}
+              onKeyDown={(event) => {
+                if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+                  event.preventDefault();
+                  const delta = event.key === "ArrowRight" ? 16 : -16;
+                  beginResize(set, index, 0);
+                  window.dispatchEvent(new MouseEvent("mousemove", { clientX: delta }));
+                  window.dispatchEvent(new MouseEvent("mouseup"));
+                }
+              }}
               onMouseDown={(event) => {
                 event.preventDefault();
                 event.stopPropagation();
