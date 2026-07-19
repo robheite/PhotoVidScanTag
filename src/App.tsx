@@ -270,6 +270,11 @@ type MoveCollisionPolicy = "skip" | "rename";
 type DuplicateCleanupMode = "move" | "delete";
 type SplitSection = "Scan" | "Library" | "Duplicates" | "Move/Copy" | "Settings";
 type MediaTypeFilter = "all" | "image" | "video";
+type SelectionModifiers = {
+  metaKey: boolean;
+  ctrlKey: boolean;
+  shiftKey: boolean;
+};
 type MissingFilterMode = "hide" | "include" | "only";
 type TagMatchMode = "any" | "all";
 type DateSourceFilter = "all" | "metadata" | "filesystem-created" | "filesystem-modified" | "unknown";
@@ -439,7 +444,7 @@ function VirtualDataGrid<T>({
   getRowClassName?: (item: T, index: number) => string;
   getRowSelected?: (item: T, index: number) => boolean;
   renderCells: (item: T, index: number) => ReactNode[];
-  onRowClick?: (item: T, index: number) => void;
+  onRowClick?: (item: T, index: number, modifiers: SelectionModifiers) => void;
   onBeginResize: (set: GridColumnSet, index: number, clientX: number) => void;
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -486,11 +491,11 @@ function VirtualDataGrid<T>({
                 tabIndex={onRowClick ? 0 : undefined}
                 aria-selected={getRowSelected?.(item, itemIndex)}
                 key={getRowKey(item, itemIndex)}
-                onClick={onRowClick ? () => onRowClick(item, itemIndex) : undefined}
+                onClick={onRowClick ? (event) => onRowClick(item, itemIndex, event) : undefined}
                 onKeyDown={onRowClick ? (event) => {
                   if (event.key === "Enter" || event.key === " ") {
                     event.preventDefault();
-                    onRowClick(item, itemIndex);
+                    onRowClick(item, itemIndex, event);
                   }
                 } : undefined}
                 style={{
@@ -773,6 +778,7 @@ function App() {
   const [skipDeleteWarningThisSession, setSkipDeleteWarningThisSession] = useState(false);
   const [skipDeleteWarningDraft, setSkipDeleteWarningDraft] = useState(false);
   const detailResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
+  const selectionAnchorIdRef = useRef<number | null>(null);
   const scanTableResizeRef = useRef<{ startY: number; startHeight: number } | null>(null);
   const [panelSplitWidths, setPanelSplitWidths] = useState<Record<SplitSection, number>>({
     Scan: 320,
@@ -1224,6 +1230,11 @@ function App() {
     () => mediaFiles.filter((item) => selectedFileIdSet.has(item.id)),
     [mediaFiles, selectedFileIdSet]
   );
+  const visibleSelectedFileCount = useMemo(
+    () => visibleMediaFiles.reduce((count, item) => count + (selectedFileIdSet.has(item.id) ? 1 : 0), 0),
+    [selectedFileIdSet, visibleMediaFiles]
+  );
+  const hiddenSelectedFileCount = Math.max(0, selectedFileIds.length - visibleSelectedFileCount);
   const moveSelectedFolderSet = useMemo(() => new Set(moveSelectedFolderPaths), [moveSelectedFolderPaths]);
   const moveSourceFiles = useMemo(() => {
     switch (moveScope) {
@@ -1245,12 +1256,18 @@ function App() {
     () => moveEligibleFiles.slice(0, scanPreviewLimit),
     [moveEligibleFiles]
   );
-  const renderSelectableMediaCard = (item: MediaFile) => (
+  const renderSelectableMediaCard = (item: MediaFile, collection: MediaFile[]) => (
     <article
       className={`media-card ${item.missing ? "missing" : ""} ${
         selectedFileIdSet.has(item.id) ? "selected" : ""
       } ${activeMediaItem?.id === item.id ? "active-item" : ""}`}
-      onClick={() => activateMediaFile(item.id)}
+      onClick={(event) => {
+        if (activeSection === "Duplicates") {
+          setActiveMediaId(item.id);
+        } else {
+          activateMediaFile(item.id, collection, event);
+        }
+      }}
       role="option"
       tabIndex={0}
       aria-selected={selectedFileIdSet.has(item.id)}
@@ -1261,10 +1278,19 @@ function App() {
         }
         if (event.key === "Enter") {
           event.preventDefault();
-          activateMediaFile(item.id);
+          if (activeSection === "Duplicates") {
+            setActiveMediaId(item.id);
+          } else {
+            activateMediaFile(item.id, collection, event);
+          }
         } else if (event.key === " ") {
           event.preventDefault();
-          toggleFileSelection(item.id);
+          if (activeSection === "Duplicates") {
+            setActiveMediaId(item.id);
+            toggleFileSelection(item.id);
+          } else {
+            activateMediaFile(item.id, collection, event);
+          }
         }
       }}
       onDoubleClick={() => {
@@ -1289,7 +1315,10 @@ function App() {
         <input
           type="checkbox"
           checked={selectedFileIdSet.has(item.id)}
-          onChange={() => toggleFileSelection(item.id)}
+          onChange={() => {
+            setActiveMediaId(item.id);
+            toggleFileSelection(item.id);
+          }}
           onClick={(event) => event.stopPropagation()}
           aria-label={`Select ${item.filename}`}
         />
@@ -1302,6 +1331,27 @@ function App() {
   useEffect(() => {
     setLibraryPage(1);
   }, [searchText, selectedTagFilter, selectedFolderPaths, activeSection]);
+
+  useEffect(() => {
+    if (activeSection !== "Library") {
+      return;
+    }
+    const handleSelectAll = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (
+        !(event.metaKey || event.ctrlKey) ||
+        event.key.toLowerCase() !== "a" ||
+        target?.isContentEditable ||
+        target?.matches("input, textarea, select")
+      ) {
+        return;
+      }
+      event.preventDefault();
+      selectVisibleFiles();
+    };
+    window.addEventListener("keydown", handleSelectAll);
+    return () => window.removeEventListener("keydown", handleSelectAll);
+  }, [activeSection, visibleMediaFiles]);
 
   useEffect(() => {
     if (libraryPage > libraryPageCount) {
@@ -2686,14 +2736,35 @@ function App() {
   }
 
   function toggleFileSelection(fileId: number) {
+    selectionAnchorIdRef.current = fileId;
     setSelectedFileIds((currentIds) =>
       currentIds.includes(fileId) ? currentIds.filter((id) => id !== fileId) : [...currentIds, fileId]
     );
   }
 
-  function activateMediaFile(fileId: number) {
+  function activateMediaFile(fileId: number, collection: MediaFile[], modifiers?: SelectionModifiers) {
     setActiveMediaId(fileId);
-    toggleFileSelection(fileId);
+
+    const additive = Boolean(modifiers?.metaKey || modifiers?.ctrlKey);
+    if (modifiers?.shiftKey && selectionAnchorIdRef.current !== null) {
+      const anchorIndex = collection.findIndex((item) => item.id === selectionAnchorIdRef.current);
+      const targetIndex = collection.findIndex((item) => item.id === fileId);
+      if (anchorIndex >= 0 && targetIndex >= 0) {
+        const [start, end] = anchorIndex <= targetIndex ? [anchorIndex, targetIndex] : [targetIndex, anchorIndex];
+        const rangeIds = collection.slice(start, end + 1).filter((item) => !item.missing).map((item) => item.id);
+        setSelectedFileIds((currentIds) => additive ? [...new Set([...currentIds, ...rangeIds])] : rangeIds);
+        return;
+      }
+    }
+
+    selectionAnchorIdRef.current = fileId;
+    if (additive) {
+      setSelectedFileIds((currentIds) =>
+        currentIds.includes(fileId) ? currentIds.filter((id) => id !== fileId) : [...currentIds, fileId]
+      );
+    } else {
+      setSelectedFileIds([fileId]);
+    }
   }
 
   function selectDuplicateGroup() {
@@ -2755,7 +2826,7 @@ function App() {
     }
 
     setSelectedFileIds((currentIds) => [...new Set([...currentIds, ...selectableVisibleIds])]);
-    setStatus(`Selected ${selectableVisibleIds.length.toLocaleString()} visible file(s)`);
+    setStatus(`Selected ${selectableVisibleIds.length.toLocaleString()} file(s) matching the current filters`);
   }
 
   function clearVisibleFiles() {
@@ -2766,7 +2837,13 @@ function App() {
     }
 
     setSelectedFileIds((currentIds) => currentIds.filter((id) => !visibleIds.has(id)));
-    setStatus("Cleared visible file selection");
+    setStatus("Cleared selections matching the current filters");
+  }
+
+  function clearAllFileSelection() {
+    selectionAnchorIdRef.current = null;
+    setSelectedFileIds([]);
+    setStatus("Cleared all file selections");
   }
 
   function resetAdvancedFilters() {
@@ -3818,7 +3895,7 @@ function App() {
                         className="move-source-grid"
                         emptyMessage="No source files are currently available for preview."
                         getItemKey={(item) => `move-preview-${item.path}`}
-                        renderItem={(item) => renderSelectableMediaCard(item)}
+                        renderItem={(item) => renderSelectableMediaCard(item, moveSourcePreviewFiles)}
                       />
                     </>
                   ) : (
@@ -4172,7 +4249,7 @@ function App() {
                           : `Run Find ${duplicateMatchMode === "exact" ? "exact" : "probable"} to load match groups.`
                       }
                       getItemKey={(item) => `${activeDuplicateGroup?.key}-${item.path}`}
-                      renderItem={(item) => renderSelectableMediaCard(item)}
+                      renderItem={(item) => renderSelectableMediaCard(item, duplicateItems)}
                     />
 
                     <VirtualDataGrid
@@ -4189,13 +4266,16 @@ function App() {
                       getRowKey={(item) => `${item.path}-duplicate-row`}
                       getRowClassName={(item) => (selectedFileIdSet.has(item.id) ? "selected" : "")}
                       getRowSelected={(item) => selectedFileIdSet.has(item.id)}
-                      onRowClick={(item) => activateMediaFile(item.id)}
+                      onRowClick={(item) => setActiveMediaId(item.id)}
                       renderCells={(item) => [
                         <span key="select">
                           <input
                             type="checkbox"
                             checked={selectedFileIdSet.has(item.id)}
-                            onChange={() => toggleFileSelection(item.id)}
+                            onChange={() => {
+                              setActiveMediaId(item.id);
+                              toggleFileSelection(item.id);
+                            }}
                             onClick={(event) => event.stopPropagation()}
                             aria-label={`Select ${item.filename}`}
                           />
@@ -4684,6 +4764,7 @@ function App() {
             </div>
             <div className="selection-action-bar" aria-label="Selection actions">
               <strong>{selectedFileIds.length.toLocaleString()} selected</strong>
+              {hiddenSelectedFileCount ? <span>{hiddenSelectedFileCount.toLocaleString()} hidden by filters</span> : null}
               <label className="tag-input">
                 <Tags size={16} />
                 <input
@@ -4708,10 +4789,13 @@ function App() {
                 Apply tag
               </button>
               <button onClick={selectVisibleFiles} disabled={!visibleMediaFiles.some((item) => !item.missing)}>
-                Select visible
+                Select all filtered ({visibleMediaFiles.filter((item) => !item.missing).length.toLocaleString()})
               </button>
               <button onClick={clearVisibleFiles} disabled={!selectedFileIds.length || !visibleMediaFiles.length}>
-                Clear visible
+                Clear filtered
+              </button>
+              <button onClick={clearAllFileSelection} disabled={!selectedFileIds.length}>
+                Clear all selection
               </button>
             </div>
             {showAdvancedFilters ? (
@@ -4878,7 +4962,7 @@ function App() {
                       className={`thumb-size-${thumbnailSize} ${activeSection === "Library" ? "library-grid" : "scan-grid"}`}
                       emptyMessage="No media files found yet. Add a path and start a scan."
                       getItemKey={(item) => item.path}
-                      renderItem={(item) => renderSelectableMediaCard(item)}
+                        renderItem={(item) => renderSelectableMediaCard(item, activePreviewFiles)}
                     /> : null}
                 {activeSection === "Scan" && visibleMediaFiles.length > previewMediaFiles.length ? (
                   <div className="preview-limit">
@@ -4984,13 +5068,16 @@ function App() {
                         getRowKey={(item) => `${item.path}-row`}
                         getRowClassName={(item) => (selectedFileIdSet.has(item.id) ? "selected" : "")}
                         getRowSelected={(item) => selectedFileIdSet.has(item.id)}
-                        onRowClick={(item) => activateMediaFile(item.id)}
+                        onRowClick={(item, _index, modifiers) => activateMediaFile(item.id, gridMediaFiles, modifiers)}
                         renderCells={(item) => [
                           <span key="select">
                             <input
                               type="checkbox"
                               checked={selectedFileIdSet.has(item.id)}
-                              onChange={() => toggleFileSelection(item.id)}
+                              onChange={() => {
+                                setActiveMediaId(item.id);
+                                toggleFileSelection(item.id);
+                              }}
                               onClick={(event) => event.stopPropagation()}
                               aria-label={`Select ${item.filename}`}
                             />
@@ -5758,7 +5845,6 @@ function loadNativeVideoPreview(path: string): Promise<string | null> {
       nativeVideoPreviewCache.set(path, previewSrc);
       return previewSrc;
     } catch {
-      nativeVideoPreviewCache.set(path, null);
       return null;
     }
   });
@@ -5863,6 +5949,15 @@ const DetailPreview = memo(function DetailPreview({ item }: { item: MediaFile })
 
   if (item.missing) {
     return <FileImage size={56} />;
+  }
+
+  if (item.mediaType === "video" && item.fileSizeBytes === 0) {
+    return (
+      <div className="detail-preview-placeholder">
+        <Film size={48} />
+        <span>This video file is empty or incomplete, so it has no playable preview.</span>
+      </div>
+    );
   }
 
   if (item.mediaType === "video" && canVideoPreviewExtension(item.extension)) {

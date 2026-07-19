@@ -4,7 +4,7 @@ use std::{
     io::{BufReader, Read, Write},
     path::{Path, PathBuf},
     sync::Mutex,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use exif::{In, Reader as ExifReader, Tag};
@@ -2872,12 +2872,26 @@ fn generate_native_video_preview_file(
     }
     fs::create_dir_all(&temp_dir).map_err(|error| error.to_string())?;
 
-    let status = std::process::Command::new("qlmanage")
+    let mut child = std::process::Command::new("qlmanage")
         .args(["-t", "-s", &max_dimension.to_string(), "-o"])
         .arg(&temp_dir)
         .arg(input_path)
-        .status()
+        .spawn()
         .map_err(|error| error.to_string())?;
+
+    let started_at = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            break status;
+        }
+        if started_at.elapsed() >= Duration::from_secs(20) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_dir_all(&temp_dir);
+            return Err("Quick Look video thumbnail generation timed out after 20 seconds".to_string());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
 
     if !status.success() {
         let _ = fs::remove_dir_all(&temp_dir);
@@ -2930,6 +2944,14 @@ fn build_native_video_preview(
 
     if !path.exists() {
         return Ok(None);
+    }
+
+    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.is_file() {
+        return Err("Video preview source is not a regular file".to_string());
+    }
+    if metadata.len() == 0 {
+        return Err("Video preview source is empty".to_string());
     }
 
     let cache_path = native_preview_cache_path(db_path, path, max_dimension, "png")?;
