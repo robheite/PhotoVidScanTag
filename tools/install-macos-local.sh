@@ -45,6 +45,9 @@ fi
 echo "Installing $APP_NAME to /Applications..."
 /usr/bin/ditto "$BUILT_APP" "$INSTALL_APP"
 
+echo "Removing copied Finder and quarantine metadata..."
+/usr/bin/xattr -cr "$INSTALL_APP"
+
 echo "Applying ad-hoc local signature..."
 /usr/bin/codesign --force --deep --sign - "$INSTALL_APP"
 
