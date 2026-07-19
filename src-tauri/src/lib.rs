@@ -1,9 +1,13 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::{BufReader, Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    sync::Mutex,
+    process::Stdio,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -19,6 +23,39 @@ mod tests;
 
 struct AppState {
     db_path: Mutex<PathBuf>,
+    playback_jobs: Arc<Mutex<HashMap<String, PlaybackJob>>>,
+}
+
+#[derive(Clone)]
+struct PlaybackJob {
+    source_path: String,
+    cancel: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct PlaybackProgress {
+    job_id: String,
+    path: String,
+    stage: String,
+    percent: Option<f64>,
+    elapsed_seconds: u64,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlaybackCacheStats {
+    file_count: usize,
+    total_bytes: u64,
+    active_jobs: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlaybackCacheClearResult {
+    files_removed: usize,
+    bytes_freed: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -83,6 +120,7 @@ struct ScanResponse {
     cached_files: usize,
     skipped_unchanged: usize,
     missing_files: usize,
+    empty_files: usize,
     total_files_seen: usize,
     supported_files_seen: usize,
     folders_visited: usize,
@@ -141,6 +179,8 @@ struct MediaFile {
     iso_value: Option<String>,
     missing: bool,
     scanned_at_unix: i64,
+    content_status: String,
+    content_issue: Option<String>,
     tags: Vec<String>,
 }
 
@@ -373,6 +413,7 @@ fn scan_media_blocking(
         cached_files: list_media_count(&conn).unwrap_or(0),
         skipped_unchanged: 0,
         missing_files: 0,
+        empty_files: 0,
         total_files_seen: 0,
         supported_files_seen: 0,
         folders_visited: 0,
@@ -525,6 +566,7 @@ fn scan_media_blocking(
     emit_scan_progress(&app, &progress);
     response.cached_files = list_media_count(&conn).map_err(|error| error.to_string())?;
     response.missing_files = missing_media_count(&conn).map_err(|error| error.to_string())?;
+    response.empty_files = empty_media_count(&conn).map_err(|error| error.to_string())?;
     response.total_files_seen = progress.total_files_seen;
     response.supported_files_seen = progress.supported_files_seen;
     response.folders_visited = progress.folders_visited;
@@ -541,7 +583,7 @@ fn scan_media_blocking(
         "failed"
     };
     let summary = format!(
-        "{} across {} path(s): {} processed, {} unchanged, {} missing",
+        "{} across {} path(s): {} processed, {} unchanged, {} missing, {} empty",
         if request.force_rescan {
             "Full scan"
         } else {
@@ -550,7 +592,8 @@ fn scan_media_blocking(
         request.paths.len(),
         response.scanned_files,
         response.skipped_unchanged,
-        response.missing_files
+        response.missing_files,
+        response.empty_files
     );
     let details = if response.errors.is_empty() {
         None
@@ -599,7 +642,7 @@ fn list_media(state: State<'_, AppState>) -> Result<Vec<MediaFile>, String> {
             "SELECT id, path, scan_root, filename, extension, media_type, file_size_bytes,
                     created_unix, modified_unix, date_taken_unix, date_source,
                     width, height, camera_make, camera_model, lens_model, aperture, focal_length, iso_value,
-                    missing, scanned_at_unix
+                    missing, scanned_at_unix, content_status, content_issue
              FROM media_files
              ORDER BY missing ASC, date_taken_unix DESC, filename ASC",
         )
@@ -1379,10 +1422,11 @@ fn find_duplicates_blocking(
             "SELECT id, path, file_size_bytes, COALESCE(file_hash, '')
              FROM media_files
              WHERE missing = 0
+               AND content_status = 'available'
                AND file_size_bytes IN (
                  SELECT file_size_bytes
                  FROM media_files
-                 WHERE missing = 0
+                 WHERE missing = 0 AND content_status = 'available'
                  GROUP BY file_size_bytes
                  HAVING COUNT(*) > 1
                )
@@ -1664,6 +1708,7 @@ fn find_probable_duplicates_blocking(
             "SELECT id, filename, media_type, file_size_bytes, date_taken_unix, modified_unix, width, height, COALESCE(file_hash, '')
              FROM media_files
              WHERE missing = 0
+               AND content_status = 'available'
              ORDER BY filename ASC, file_size_bytes DESC",
         )
         .map_err(|error| error.to_string())?;
@@ -1857,11 +1902,12 @@ fn warm_duplicate_hashes_blocking(
             "SELECT id, path
              FROM media_files
              WHERE missing = 0
+               AND content_status = 'available'
                AND COALESCE(file_hash, '') = ''
                AND file_size_bytes IN (
                  SELECT file_size_bytes
                  FROM media_files
-                 WHERE missing = 0
+                 WHERE missing = 0 AND content_status = 'available'
                  GROUP BY file_size_bytes
                  HAVING COUNT(*) > 1
                )
@@ -2210,6 +2256,8 @@ async fn generate_native_video_preview(
 #[tauri::command]
 async fn generate_video_playback_proxy(
     path: String,
+    job_id: String,
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     let db_path = state
@@ -2217,11 +2265,80 @@ async fn generate_video_playback_proxy(
         .lock()
         .map_err(|_| "Database state is unavailable".to_string())?
         .clone();
-    let video_path = PathBuf::from(path);
+    let video_path = PathBuf::from(&path);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let jobs = state.playback_jobs.clone();
+    {
+        let mut active = jobs
+            .lock()
+            .map_err(|_| "Playback job registry is unavailable".to_string())?;
+        if active.values().any(|job| job.source_path == path) {
+            return Err("A playable preview is already being prepared for this video".to_string());
+        }
+        active.insert(
+            job_id.clone(),
+            PlaybackJob {
+                source_path: path.clone(),
+                cancel: cancel.clone(),
+            },
+        );
+    }
 
-    tauri::async_runtime::spawn_blocking(move || build_video_playback_proxy(&video_path, &db_path))
-        .await
-        .map_err(|error| error.to_string())?
+    let joined = tauri::async_runtime::spawn_blocking(move || {
+        build_video_playback_proxy_controlled(&video_path, &db_path, &job_id, &app, &cancel)
+    })
+    .await;
+    if let Ok(mut active) = jobs.lock() {
+        active.retain(|_, job| job.source_path != path);
+    }
+    joined.map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+fn cancel_video_playback_proxy(job_id: String, state: State<'_, AppState>) -> Result<bool, String> {
+    let active = state
+        .playback_jobs
+        .lock()
+        .map_err(|_| "Playback job registry is unavailable".to_string())?;
+    if let Some(job) = active.get(&job_id) {
+        job.cancel.store(true, Ordering::Relaxed);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+#[tauri::command]
+fn get_playback_cache_stats(state: State<'_, AppState>) -> Result<PlaybackCacheStats, String> {
+    let db_path = state
+        .db_path
+        .lock()
+        .map_err(|_| "Database state is unavailable".to_string())?
+        .clone();
+    let active_jobs = state
+        .playback_jobs
+        .lock()
+        .map_err(|_| "Playback job registry is unavailable".to_string())?
+        .len();
+    playback_cache_stats(&db_path, active_jobs)
+}
+
+#[tauri::command]
+fn clear_playback_cache(state: State<'_, AppState>) -> Result<PlaybackCacheClearResult, String> {
+    let db_path = state
+        .db_path
+        .lock()
+        .map_err(|_| "Database state is unavailable".to_string())?
+        .clone();
+    if !state
+        .playback_jobs
+        .lock()
+        .map_err(|_| "Playback job registry is unavailable".to_string())?
+        .is_empty()
+    {
+        return Err("Wait for active playable-preview conversions to finish or cancel them first".to_string());
+    }
+    clear_playback_cache_files(&db_path)
 }
 
 #[tauri::command]
@@ -2343,7 +2460,9 @@ fn init_db(conn: &Connection) -> rusqlite::Result<()> {
             iso_value TEXT,
             missing INTEGER NOT NULL DEFAULT 0,
             last_seen_scan_id INTEGER NOT NULL,
-            scanned_at_unix INTEGER NOT NULL
+            scanned_at_unix INTEGER NOT NULL,
+            content_status TEXT NOT NULL DEFAULT 'available',
+            content_issue TEXT
         );
 
         CREATE TABLE IF NOT EXISTS tags (
@@ -2388,6 +2507,19 @@ fn init_db(conn: &Connection) -> rusqlite::Result<()> {
     ensure_column(conn, "media_files", "aperture", "TEXT")?;
     ensure_column(conn, "media_files", "focal_length", "TEXT")?;
     ensure_column(conn, "media_files", "iso_value", "TEXT")?;
+    ensure_column(
+        conn,
+        "media_files",
+        "content_status",
+        "TEXT NOT NULL DEFAULT 'available'",
+    )?;
+    ensure_column(conn, "media_files", "content_issue", "TEXT")?;
+    conn.execute(
+        "UPDATE media_files
+         SET content_status = 'empty', content_issue = 'File is 0 bytes; it has no media content'
+         WHERE file_size_bytes = 0 AND content_status != 'empty'",
+        [],
+    )?;
     Ok(())
 }
 
@@ -2409,7 +2541,7 @@ fn normalize_filter_preset(preset: FilterPreset) -> Option<FilterPreset> {
             preset.extension_filter.trim().to_lowercase()
         },
         missing_filter_mode: match preset.missing_filter_mode.as_str() {
-            "include" | "only" => preset.missing_filter_mode,
+            "include" | "only" | "invalid" => preset.missing_filter_mode,
             _ => "hide".to_string(),
         },
         tag_filter_input: preset.tag_filter_input.trim().to_string(),
@@ -2600,7 +2732,7 @@ fn query_media_file(conn: &Connection, file_id: i64) -> Result<MediaFile, String
             "SELECT id, path, scan_root, filename, extension, media_type, file_size_bytes,
                     created_unix, modified_unix, date_taken_unix, date_source,
                     width, height, camera_make, camera_model, lens_model, aperture, focal_length, iso_value,
-                    missing, scanned_at_unix
+                    missing, scanned_at_unix, content_status, content_issue
              FROM media_files
              WHERE id = ?1",
         )
@@ -2627,7 +2759,7 @@ fn query_media_files_by_ids(conn: &Connection, file_ids: &[i64]) -> Result<HashM
             "SELECT id, path, scan_root, filename, extension, media_type, file_size_bytes,
                     created_unix, modified_unix, date_taken_unix, date_source,
                     width, height, camera_make, camera_model, lens_model, aperture, focal_length, iso_value,
-                    missing, scanned_at_unix
+                    missing, scanned_at_unix, content_status, content_issue
              FROM media_files
              WHERE id IN ({placeholders})"
         );
@@ -2750,6 +2882,110 @@ fn playback_proxy_cache_path(db_path: &Path, path: &Path) -> Result<PathBuf, Str
     hasher.update(metadata.len().to_le_bytes());
     hasher.update(b"mac-avconvert-apple-m4v-720p-v1");
     Ok(playback_cache_dir(db_path).join(format!("{:x}.m4v", hasher.finalize())))
+}
+
+fn parse_avconvert_progress(value: &str) -> Option<f64> {
+    let marker = value.rfind("progress:")?;
+    let remainder = &value[marker + "progress:".len()..];
+    let token = remainder
+        .split_whitespace()
+        .find(|token| token.trim_end_matches('%').parse::<f64>().is_ok())?;
+    let parsed = token.trim_end_matches('%').parse::<f64>().ok()?;
+    if parsed.is_finite() {
+        Some(parsed.clamp(0.0, 100.0))
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_avconvert_progress_reader<R: Read + Send + 'static>(reader: R, progress: Arc<AtomicU64>) {
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(reader);
+        let mut chunk = Vec::new();
+        loop {
+            chunk.clear();
+            match reader.read_until(b'\r', &mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let text = String::from_utf8_lossy(&chunk);
+                    if let Some(percent) = parse_avconvert_progress(&text) {
+                        progress.store((percent * 100.0).round() as u64, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn playback_cache_stats(db_path: &Path, active_jobs: usize) -> Result<PlaybackCacheStats, String> {
+    let cache_dir = playback_cache_dir(db_path);
+    let mut stats = PlaybackCacheStats {
+        file_count: 0,
+        total_bytes: 0,
+        active_jobs,
+    };
+    if !cache_dir.exists() {
+        return Ok(stats);
+    }
+    for entry in fs::read_dir(cache_dir).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let file_type = entry.file_type().map_err(|error| error.to_string())?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if file_type.is_file() && name.ends_with(".m4v") && !name.contains(".partial.m4v") {
+            stats.file_count += 1;
+            stats.total_bytes += entry.metadata().map_err(|error| error.to_string())?.len();
+        }
+    }
+    Ok(stats)
+}
+
+fn clear_playback_cache_files(db_path: &Path) -> Result<PlaybackCacheClearResult, String> {
+    let cache_dir = playback_cache_dir(db_path);
+    let mut result = PlaybackCacheClearResult {
+        files_removed: 0,
+        bytes_freed: 0,
+    };
+    if !cache_dir.exists() {
+        return Ok(result);
+    }
+    for entry in fs::read_dir(cache_dir).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let file_type = entry.file_type().map_err(|error| error.to_string())?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !file_type.is_file() || !name.ends_with(".m4v") {
+            continue;
+        }
+        let bytes = entry.metadata().map_err(|error| error.to_string())?.len();
+        fs::remove_file(entry.path()).map_err(|error| error.to_string())?;
+        result.files_removed += 1;
+        result.bytes_freed += bytes;
+    }
+    Ok(result)
+}
+
+fn emit_playback_progress(
+    app: Option<&tauri::AppHandle>,
+    job_id: &str,
+    path: &Path,
+    stage: &str,
+    percent: Option<f64>,
+    started_at: Instant,
+    message: &str,
+) {
+    if let Some(app) = app {
+        let _ = app.emit(
+            "video-playback-progress",
+            PlaybackProgress {
+                job_id: job_id.to_string(),
+                path: path.to_string_lossy().to_string(),
+                stage: stage.to_string(),
+                percent,
+                elapsed_seconds: started_at.elapsed().as_secs(),
+                message: message.to_string(),
+            },
+        );
+    }
 }
 
 fn native_preview_cache_path(
@@ -3007,8 +3243,33 @@ fn build_native_video_preview(
     Ok(Some(cache_path.to_string_lossy().to_string()))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", test))]
 fn build_video_playback_proxy(path: &Path, db_path: &Path) -> Result<String, String> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    build_video_playback_proxy_inner(path, db_path, "test", None, &cancel)
+}
+
+#[cfg(target_os = "macos")]
+fn build_video_playback_proxy_controlled(
+    path: &Path,
+    db_path: &Path,
+    job_id: &str,
+    app: &tauri::AppHandle,
+    cancel: &Arc<AtomicBool>,
+) -> Result<String, String> {
+    build_video_playback_proxy_inner(path, db_path, job_id, Some(app), cancel)
+}
+
+#[cfg(target_os = "macos")]
+fn build_video_playback_proxy_inner(
+    path: &Path,
+    db_path: &Path,
+    job_id: &str,
+    app: Option<&tauri::AppHandle>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<String, String> {
+    let started_at = Instant::now();
+    emit_playback_progress(app, job_id, path, "validating", None, started_at, "Checking source video");
     if !path.exists() {
         return Err("The source video is no longer available".to_string());
     }
@@ -3022,35 +3283,59 @@ fn build_video_playback_proxy(path: &Path, db_path: &Path) -> Result<String, Str
 
     let cache_path = playback_proxy_cache_path(db_path, path)?;
     if cache_path.exists() && fs::metadata(&cache_path).map(|value| value.len() > 0).unwrap_or(false) {
+        emit_playback_progress(app, job_id, path, "complete", Some(100.0), started_at, "Using cached playable preview");
         return Ok(cache_path.to_string_lossy().to_string());
     }
 
     fs::create_dir_all(playback_cache_dir(db_path)).map_err(|error| error.to_string())?;
-    let partial_path = cache_path.with_extension("partial.m4v");
+    let safe_job_id = job_id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
+        .take(64)
+        .collect::<String>();
+    let partial_path = cache_path.with_extension(format!("{safe_job_id}.partial.m4v"));
     let _ = fs::remove_file(&partial_path);
+    let progress_value = Arc::new(AtomicU64::new(0));
     let mut child = std::process::Command::new("avconvert")
         .args(["--source"])
         .arg(path)
         .args(["--output"])
         .arg(&partial_path)
-        .args([
-            "--preset",
-            "PresetAppleM4V720pHD",
-            "--replace",
-        ])
+        .args(["--preset", "PresetAppleM4V720pHD", "--replace", "--progress"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("Unable to start the macOS video converter: {error}"))?;
 
-    let started_at = Instant::now();
+    if let Some(stdout) = child.stdout.take() {
+        spawn_avconvert_progress_reader(stdout, progress_value.clone());
+    }
+    if let Some(stderr) = child.stderr.take() {
+        spawn_avconvert_progress_reader(stderr, progress_value.clone());
+    }
+    emit_playback_progress(app, job_id, path, "converting", Some(0.0), started_at, "Creating compatible H.264/AAC preview");
+    let mut last_emitted = Instant::now() - Duration::from_secs(1);
     let status = loop {
         if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
             break status;
+        }
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&partial_path);
+            emit_playback_progress(app, job_id, path, "canceled", None, started_at, "Playable-preview conversion canceled");
+            return Err("Playable-preview conversion was canceled".to_string());
         }
         if started_at.elapsed() >= Duration::from_secs(15 * 60) {
             let _ = child.kill();
             let _ = child.wait();
             let _ = fs::remove_file(&partial_path);
             return Err("Playable-preview conversion timed out after 15 minutes".to_string());
+        }
+        if last_emitted.elapsed() >= Duration::from_millis(500) {
+            let percent = progress_value.load(Ordering::Relaxed) as f64 / 100.0;
+            emit_playback_progress(app, job_id, path, "converting", Some(percent), started_at, "Creating compatible H.264/AAC preview");
+            last_emitted = Instant::now();
         }
         std::thread::sleep(Duration::from_millis(200));
     };
@@ -3066,12 +3351,25 @@ fn build_video_playback_proxy(path: &Path, db_path: &Path) -> Result<String, Str
         return Err("macOS completed conversion without producing a playable preview".to_string());
     }
 
+    emit_playback_progress(app, job_id, path, "finalizing", Some(100.0), started_at, "Finalizing cached playable preview");
     fs::rename(&partial_path, &cache_path).map_err(|error| error.to_string())?;
+    emit_playback_progress(app, job_id, path, "complete", Some(100.0), started_at, "Playable preview ready");
     Ok(cache_path.to_string_lossy().to_string())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), test))]
 fn build_video_playback_proxy(_path: &Path, _db_path: &Path) -> Result<String, String> {
+    Err("Automatic playable-preview conversion is currently available on macOS only".to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn build_video_playback_proxy_controlled(
+    _path: &Path,
+    _db_path: &Path,
+    _job_id: &str,
+    _app: &tauri::AppHandle,
+    _cancel: &Arc<AtomicBool>,
+) -> Result<String, String> {
     Err("Automatic playable-preview conversion is currently available on macOS only".to_string())
 }
 
@@ -3163,6 +3461,7 @@ fn read_native_video_metadata(_path: &Path) -> Result<VideoMetadataDetails, Stri
     Ok(VideoMetadataDetails::default())
 }
 
+#[cfg(target_os = "windows")]
 fn normalize_windows_video_codec(value: String) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -3242,15 +3541,24 @@ fn cache_media_file(
 
     let path_string = path.to_string_lossy().to_string();
     let file_size_bytes = metadata.len() as i64;
+    let (content_status, content_issue) = if file_size_bytes == 0 {
+        (
+            "empty",
+            Some("File is 0 bytes; it has no media content".to_string()),
+        )
+    } else {
+        ("available", None)
+    };
     let modified_unix = metadata.modified().ok().and_then(system_time_to_unix);
     let existing = existing_index.get(&path_string).copied();
 
     if !force_rescan && existing == Some((file_size_bytes, modified_unix)) {
         conn.execute(
             "UPDATE media_files
-             SET missing = 0, last_seen_scan_id = ?1, scanned_at_unix = ?2
-             WHERE path = ?3",
-            params![scan_run_id, scanned_at, path_string],
+             SET missing = 0, last_seen_scan_id = ?1, scanned_at_unix = ?2,
+                 content_status = ?3, content_issue = ?4
+             WHERE path = ?5",
+            params![scan_run_id, scanned_at, content_status, content_issue, path_string],
         )?;
         return Ok(false);
     }
@@ -3287,9 +3595,10 @@ fn cache_media_file(
             path, scan_root, filename, extension, media_type, file_size_bytes,
             created_unix, modified_unix, date_taken_unix, date_source,
             width, height, camera_make, camera_model, lens_model, aperture, focal_length, iso_value,
-            missing, last_seen_scan_id, scanned_at_unix, file_hash, hash_updated_at_unix
+            missing, last_seen_scan_id, scanned_at_unix, content_status, content_issue,
+            file_hash, hash_updated_at_unix
          )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, 0, ?19, ?20, NULL, NULL)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, 0, ?19, ?20, ?21, ?22, NULL, NULL)
          ON CONFLICT(path) DO UPDATE SET
             scan_root = excluded.scan_root,
             filename = excluded.filename,
@@ -3322,7 +3631,9 @@ fn cache_media_file(
             END,
             missing = 0,
             last_seen_scan_id = excluded.last_seen_scan_id,
-            scanned_at_unix = excluded.scanned_at_unix",
+            scanned_at_unix = excluded.scanned_at_unix,
+            content_status = excluded.content_status,
+            content_issue = excluded.content_issue",
         params![
             path_string,
             scan_root,
@@ -3343,7 +3654,9 @@ fn cache_media_file(
             focal_length,
             iso_value,
             scan_run_id,
-            scanned_at
+            scanned_at,
+            content_status,
+            content_issue
         ],
     )?;
     existing_index.insert(path_string, (file_size_bytes, modified_unix));
@@ -3513,6 +3826,8 @@ fn map_media_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaFile> {
         iso_value: row.get(18)?,
         missing: row.get::<_, i64>(19)? == 1,
         scanned_at_unix: row.get(20)?,
+        content_status: row.get(21)?,
+        content_issue: row.get(22)?,
         tags: Vec::new(),
     })
 }
@@ -3527,6 +3842,15 @@ fn list_media_count(conn: &Connection) -> rusqlite::Result<usize> {
 fn missing_media_count(conn: &Connection) -> rusqlite::Result<usize> {
     conn.query_row(
         "SELECT COUNT(*) FROM media_files WHERE missing = 1",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|count| count as usize)
+}
+
+fn empty_media_count(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM media_files WHERE missing = 0 AND content_status = 'empty'",
         [],
         |row| row.get::<_, i64>(0),
     )
@@ -3819,6 +4143,7 @@ pub fn run() {
             init_db(&conn)?;
             app.manage(AppState {
                 db_path: Mutex::new(db_path),
+                playback_jobs: Arc::new(Mutex::new(HashMap::new())),
             });
             let setup_ms = setup_started.elapsed().as_millis();
             let startup_ms = app_started.elapsed().as_millis();
@@ -3837,6 +4162,9 @@ pub fn run() {
             generate_native_image_preview,
             generate_native_video_preview,
             generate_video_playback_proxy,
+            cancel_video_playback_proxy,
+            get_playback_cache_stats,
+            clear_playback_cache,
             read_video_metadata_details,
             open_file_path,
             open_file_location,

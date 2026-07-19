@@ -2,7 +2,7 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { applyMediaSelection, type SelectionModifiers } from "./selection";
-import { describeVideoPlaybackError } from "./videoPlayback";
+import { describeVideoPlaybackError, playbackProgressMatchesJob } from "./videoPlayback";
 import {
   AlertCircle,
   CalendarClock,
@@ -104,6 +104,8 @@ type MediaFile = {
   isoValue: string | null;
   missing: boolean;
   scannedAtUnix: number;
+  contentStatus: "available" | "empty";
+  contentIssue: string | null;
   tags: string[];
 };
 
@@ -118,6 +120,7 @@ type ScanResponse = {
   cachedFiles: number;
   skippedUnchanged: number;
   missingFiles: number;
+  emptyFiles: number;
   totalFilesSeen: number;
   supportedFilesSeen: number;
   foldersVisited: number;
@@ -272,7 +275,7 @@ type MoveCollisionPolicy = "skip" | "rename";
 type DuplicateCleanupMode = "move" | "delete";
 type SplitSection = "Scan" | "Library" | "Duplicates" | "Move/Copy" | "Settings";
 type MediaTypeFilter = "all" | "image" | "video";
-type MissingFilterMode = "hide" | "include" | "only";
+type MissingFilterMode = "hide" | "include" | "only" | "invalid";
 type TagMatchMode = "any" | "all";
 type DateSourceFilter = "all" | "metadata" | "filesystem-created" | "filesystem-modified" | "unknown";
 type FilterPreset = {
@@ -342,7 +345,27 @@ const nativeImagePreviewInflight = new Map<string, Promise<string | null>>();
 const nativeVideoPreviewCache = new Map<string, string | null>();
 const nativeVideoPreviewInflight = new Map<string, Promise<string | null>>();
 const videoPlaybackProxyCache = new Map<string, string>();
-const videoPlaybackProxyInflight = new Map<string, Promise<string>>();
+const videoPlaybackProxyInflight = new Map<string, { jobId: string; promise: Promise<string> }>();
+
+type VideoPlaybackProgress = {
+  jobId: string;
+  path: string;
+  stage: string;
+  percent: number | null;
+  elapsedSeconds: number;
+  message: string;
+};
+
+type PlaybackCacheStats = {
+  fileCount: number;
+  totalBytes: number;
+  activeJobs: number;
+};
+
+type PlaybackCacheClearResult = {
+  filesRemoved: number;
+  bytesFreed: number;
+};
 const imageMetadataHydrationAttempts = new Set<number>();
 const videoThumbnailQueue: LimitedQueue = { active: 0, limit: 2, pending: [] };
 const videoMetadataQueue: LimitedQueue = { active: 0, limit: 2, pending: [] };
@@ -766,6 +789,8 @@ function App() {
   const [moveCollisionPolicy, setMoveCollisionPolicy] = useState<MoveCollisionPolicy>("skip");
   const [lastMoveExecutionReport, setLastMoveExecutionReport] = useState<MoveExecutionReport | null>(null);
   const [appSettings, setAppSettings] = useState<AppSettings | null>(null);
+  const [playbackCacheStats, setPlaybackCacheStats] = useState<PlaybackCacheStats | null>(null);
+  const [isClearingPlaybackCache, setIsClearingPlaybackCache] = useState(false);
   const [operationHistory, setOperationHistory] = useState<OperationHistoryEntry[]>([]);
   const [duplicateCleanupMode, setDuplicateCleanupMode] = useState<DuplicateCleanupMode>("move");
   const [duplicateCleanupDestination, setDuplicateCleanupDestination] = useState("");
@@ -800,6 +825,12 @@ function App() {
   useEffect(() => {
     void initializeAppData();
   }, []);
+
+  useEffect(() => {
+    if (activeSection === "Settings") {
+      void invoke<PlaybackCacheStats>("get_playback_cache_stats").then(setPlaybackCacheStats);
+    }
+  }, [activeSection]);
 
   useEffect(() => {
     setMovePreviewItems([]);
@@ -1007,7 +1038,11 @@ function App() {
         }
       }
 
-      if (missingFilterMode === "only") {
+      if (missingFilterMode === "invalid") {
+        if (file.contentStatus === "available" || file.missing) {
+          continue;
+        }
+      } else if (missingFilterMode === "only") {
         if (!file.missing) {
           continue;
         }
@@ -1179,7 +1214,7 @@ function App() {
     () =>
       mediaFiles.filter(
         (item) =>
-          !item.missing &&
+          !item.missing && item.contentStatus === "available" &&
           scanPaths.includes(item.scanRoot) &&
           (canNativePreviewExtension(item.extension) || canVideoPreviewExtension(item.extension))
       ),
@@ -1248,7 +1283,7 @@ function App() {
     }
   }, [mediaFiles, mediaIndex, moveScope, moveSelectedFolderSet, selectedFiles]);
   const moveEligibleFiles = useMemo(
-    () => moveSourceFiles.filter((item) => !item.missing),
+    () => moveSourceFiles.filter((item) => !item.missing && item.contentStatus === "available"),
     [moveSourceFiles]
   );
   const moveSourcePreviewFiles = useMemo(
@@ -1257,7 +1292,7 @@ function App() {
   );
   const renderSelectableMediaCard = (item: MediaFile, collection: MediaFile[]) => (
     <article
-      className={`media-card ${item.missing ? "missing" : ""} ${
+      className={`media-card ${item.missing ? "missing" : ""} ${item.contentStatus !== "available" ? "invalid-media" : ""} ${
         selectedFileIdSet.has(item.id) ? "selected" : ""
       } ${activeMediaItem?.id === item.id ? "active-item" : ""}`}
       onClick={(event) => {
@@ -1270,7 +1305,7 @@ function App() {
       role="option"
       tabIndex={0}
       aria-selected={selectedFileIdSet.has(item.id)}
-      aria-label={`${item.filename}, ${item.extension.toUpperCase()}${item.missing ? ", missing" : ""}`}
+      aria-label={`${item.filename}, ${item.extension.toUpperCase()}${item.missing ? ", missing" : ""}${item.contentIssue ? `, ${item.contentIssue}` : ""}`}
       onKeyDown={(event) => {
         if (event.target !== event.currentTarget) {
           return;
@@ -1323,6 +1358,7 @@ function App() {
         />
         <PreviewImage item={item} />
         <span>{item.extension.toUpperCase()}</span>
+        {item.contentStatus !== "available" ? <span className="content-issue-badge"><AlertCircle size={12} /> Empty</span> : null}
       </div>
     </article>
   );
@@ -1478,14 +1514,15 @@ function App() {
 
   async function initializeAppData() {
     try {
-      const [defaultExtensions, settings, files, roots, folders, savedTags, history] = await Promise.all([
+      const [defaultExtensions, settings, files, roots, folders, savedTags, history, cacheStats] = await Promise.all([
         invoke<string[]>("supported_extensions"),
         invoke<AppSettings>("get_app_settings"),
         invoke<MediaFile[]>("list_media"),
         invoke<ScanRoot[]>("list_scan_roots"),
         invoke<ScanFolder[]>("list_scan_folders"),
         invoke<TagSummary[]>("list_tags"),
-        invoke<OperationHistoryEntry[]>("list_operation_history")
+        invoke<OperationHistoryEntry[]>("list_operation_history"),
+        invoke<PlaybackCacheStats>("get_playback_cache_stats")
       ]);
       setAvailableExtensions(defaultExtensions);
       setAppSettings(settings);
@@ -1501,6 +1538,7 @@ function App() {
       setScanFolders(folders);
       setTags(savedTags);
       setOperationHistory(history);
+      setPlaybackCacheStats(cacheStats);
       setScanPaths((current) => (current.length ? current : roots.map((root) => root.path)));
       const initialTree = buildFolderTree(roots.map((root) => root.path), folders, files);
       setSelectedFolderPaths(collectNodePaths(initialTree));
@@ -1735,6 +1773,7 @@ function App() {
       ["Cached files", `${lastScanExecutionReport.result.cachedFiles}`],
       ["Unchanged files", `${lastScanExecutionReport.result.skippedUnchanged}`],
       ["Missing files", `${lastScanExecutionReport.result.missingFiles}`],
+      ["Empty media files", `${lastScanExecutionReport.result.emptyFiles}`],
       ["Current media records in scope", `${scanScopeMediaFiles.length}`],
       ["Warnings / errors", `${lastScanExecutionReport.result.errors.length}`]
     ];
@@ -1975,6 +2014,8 @@ function App() {
       item.tags.join(", "),
       item.scanRoot,
       item.missing ? "Yes" : "No",
+      item.contentStatus,
+      item.contentIssue ?? "",
       item.path,
       movePreviewById.get(item.id) ?? ""
     ]);
@@ -2005,6 +2046,8 @@ function App() {
         "Tags",
         "Scan Root",
         "Missing",
+        "Content Status",
+        "Content Issue",
         "Current Path",
         "Planned Destination"
       ]
@@ -2142,6 +2185,26 @@ function App() {
       setStatus("Opened app data location");
     } catch (error) {
       setStatus(`Open app data location failed: ${String(error)}`);
+    }
+  }
+
+  async function clearPlaybackCache() {
+    if (!window.confirm("Clear all cached playable previews? Original media files will not be changed.")) {
+      return;
+    }
+    setIsClearingPlaybackCache(true);
+    try {
+      const result = await invoke<PlaybackCacheClearResult>("clear_playback_cache");
+      videoPlaybackProxyCache.clear();
+      const stats = await invoke<PlaybackCacheStats>("get_playback_cache_stats");
+      setPlaybackCacheStats(stats);
+      setStatus(
+        `Cleared ${result.filesRemoved.toLocaleString()} playable preview(s), freeing ${formatFileSize(result.bytesFreed)}`
+      );
+    } catch (error) {
+      setStatus(`Playback cache could not be cleared: ${String(error)}`);
+    } finally {
+      setIsClearingPlaybackCache(false);
     }
   }
 
@@ -3583,6 +3646,33 @@ function App() {
                   </div>
 
                   <div className="planner-section">
+                    <strong>Playable preview cache</strong>
+                    <div className="panel-note">
+                      <strong>
+                        {playbackCacheStats
+                          ? `${playbackCacheStats.fileCount.toLocaleString()} preview(s) · ${formatFileSize(playbackCacheStats.totalBytes)}`
+                          : "Loading playback cache…"}
+                      </strong>
+                      <span>
+                        Compatible H.264/AAC copies are stored locally. Originals are never changed.
+                        {playbackCacheStats?.activeJobs ? ` ${playbackCacheStats.activeJobs} conversion(s) active.` : ""}
+                      </span>
+                    </div>
+                    <div className="detail-actions">
+                      <button
+                        onClick={() => void clearPlaybackCache()}
+                        disabled={
+                          isClearingPlaybackCache ||
+                          !playbackCacheStats?.fileCount ||
+                          Boolean(playbackCacheStats?.activeJobs)
+                        }
+                      >
+                        {isClearingPlaybackCache ? "Clearing cached previews…" : "Clear cached playable previews"}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="planner-section">
                     <strong>Logging</strong>
                     <div className="planner-grid">
                       <label>
@@ -4319,6 +4409,10 @@ function App() {
                               <strong>{activeMediaItem.extension.toUpperCase()} / {formatMediaType(activeMediaItem.mediaType)}</strong>
                             </div>
                             <div className="detail-row">
+                              <span><AlertCircle size={14} /> Content status</span>
+                              <strong>{activeMediaItem.contentIssue ?? "Available"}</strong>
+                            </div>
+                            <div className="detail-row">
                               <span><HardDrive size={14} /> File size</span>
                               <strong>{formatFileSize(activeMediaItem.fileSizeBytes)}</strong>
                             </div>
@@ -4603,6 +4697,7 @@ function App() {
                       <span>{lastScanExecutionReport.result.supportedFilesSeen.toLocaleString()} media files seen</span>
                       <span>{lastScanExecutionReport.result.scannedFiles.toLocaleString()} processed</span>
                       <span>{lastScanExecutionReport.result.missingFiles.toLocaleString()} missing</span>
+                      <span>{lastScanExecutionReport.result.emptyFiles.toLocaleString()} empty</span>
                     </div>
                     {previewWarmProgress ? (
                       <div className="warm-preview-summary">
@@ -4811,6 +4906,7 @@ function App() {
                     <option value="hide">Hide missing</option>
                     <option value="include">Include missing</option>
                     <option value="only">Only missing</option>
+                    <option value="invalid">Empty/incomplete</option>
                   </select>
                 </label>
                 <label className="tag-filter-field">
@@ -5120,6 +5216,10 @@ function App() {
                         <div className="detail-row">
                           <span><FileImage size={14} /> Type</span>
                           <strong>{activeMediaItem.extension.toUpperCase()} / {formatMediaType(activeMediaItem.mediaType)}</strong>
+                        </div>
+                        <div className="detail-row">
+                          <span><AlertCircle size={14} /> Content status</span>
+                          <strong>{activeMediaItem.contentIssue ?? "Available"}</strong>
                         </div>
                         <div className="detail-row">
                           <span><CalendarClock size={14} /> Date taken</span>
@@ -5837,24 +5937,29 @@ function loadNativeVideoPreview(path: string): Promise<string | null> {
   return previewPromise;
 }
 
-function loadVideoPlaybackProxy(path: string): Promise<string> {
+function startVideoPlaybackProxy(path: string): { jobId: string | null; promise: Promise<string> } {
   const cached = videoPlaybackProxyCache.get(path);
   if (cached) {
-    return Promise.resolve(cached);
+    return { jobId: null, promise: Promise.resolve(cached) };
   }
   const inflight = videoPlaybackProxyInflight.get(path);
   if (inflight) {
     return inflight;
   }
 
-  const proxyPromise = invoke<string>("generate_video_playback_proxy", { path }).then((proxyPath) => {
+  const jobId = crypto.randomUUID();
+  const proxyPromise = invoke<string>("generate_video_playback_proxy", { path, jobId }).then((proxyPath) => {
     const proxySrc = convertFileSrc(proxyPath);
     videoPlaybackProxyCache.set(path, proxySrc);
     return proxySrc;
   });
-  videoPlaybackProxyInflight.set(path, proxyPromise);
-  void proxyPromise.finally(() => videoPlaybackProxyInflight.delete(path));
-  return proxyPromise;
+  const result = { jobId, promise: proxyPromise };
+  videoPlaybackProxyInflight.set(path, result);
+  void proxyPromise.then(
+    () => videoPlaybackProxyInflight.delete(path),
+    () => videoPlaybackProxyInflight.delete(path),
+  );
+  return result;
 }
 
 function testImagePreview(path: string): Promise<boolean> {
@@ -5880,8 +5985,8 @@ function testImagePreview(path: string): Promise<boolean> {
 const PreviewImage = memo(function PreviewImage({ item }: { item: MediaFile }) {
   const [failed, setFailed] = useState(false);
   const [nativePreviewSrc, setNativePreviewSrc] = useState<string | null>(null);
-  const canPreview = !item.missing && canPreviewExtension(item.extension);
-  const needsNativePreview = !item.missing && canNativePreviewExtension(item.extension);
+  const canPreview = !item.missing && item.contentStatus === "available" && canPreviewExtension(item.extension);
+  const needsNativePreview = !item.missing && item.contentStatus === "available" && canNativePreviewExtension(item.extension);
 
   useEffect(() => {
     let canceled = false;
@@ -5927,9 +6032,11 @@ const DetailPreview = memo(function DetailPreview({ item }: { item: MediaFile })
   const [playbackError, setPlaybackError] = useState<string | null>(null);
   const [playbackProxyError, setPlaybackProxyError] = useState<string | null>(null);
   const [playbackReady, setPlaybackReady] = useState(false);
+  const [playbackJobId, setPlaybackJobId] = useState<string | null>(null);
+  const [playbackProgress, setPlaybackProgress] = useState<VideoPlaybackProgress | null>(null);
   const playbackMetadata = useVideoMetadata(item);
-  const needsNativeImagePreview = !item.missing && canNativePreviewExtension(item.extension);
-  const needsNativeVideoPreview = !item.missing && item.mediaType === "video" && canVideoPreviewExtension(item.extension);
+  const needsNativeImagePreview = !item.missing && item.contentStatus === "available" && canNativePreviewExtension(item.extension);
+  const needsNativeVideoPreview = !item.missing && item.contentStatus === "available" && item.mediaType === "video" && canVideoPreviewExtension(item.extension);
 
   useEffect(() => {
     let canceled = false;
@@ -5945,6 +6052,8 @@ const DetailPreview = memo(function DetailPreview({ item }: { item: MediaFile })
     setPlaybackProxyStatus("idle");
     setPlaybackProxySrc(videoPlaybackProxyCache.get(item.path) ?? null);
     setPlaybackReady(false);
+    setPlaybackJobId(null);
+    setPlaybackProgress(null);
     setNativePreviewSrc(
       needsNativeVideoPreview
         ? nativeVideoPreviewCache.get(item.path) ?? null
@@ -5976,32 +6085,57 @@ const DetailPreview = memo(function DetailPreview({ item }: { item: MediaFile })
     return () => window.clearTimeout(timer);
   }, [failed, needsNativeVideoPreview, playbackProxySrc, playbackReady]);
 
+  useEffect(() => {
+    if (!playbackJobId) {
+      return;
+    }
+    let dispose: (() => void) | null = null;
+    void listen<VideoPlaybackProgress>("video-playback-progress", (event) => {
+      if (playbackProgressMatchesJob(playbackJobId, event.payload.jobId)) {
+        setPlaybackProgress(event.payload);
+      }
+    }).then((unlisten) => {
+      dispose = unlisten;
+    });
+    return () => dispose?.();
+  }, [playbackJobId]);
+
   const preparePlayablePreview = () => {
     setPlaybackProxyStatus("generating");
     setPlaybackProxyError(null);
-    void loadVideoPlaybackProxy(item.path)
+    const conversion = startVideoPlaybackProxy(item.path);
+    setPlaybackJobId(conversion.jobId);
+    void conversion.promise
       .then((proxySrc) => {
         setPlaybackProxySrc(proxySrc);
         setPlaybackReady(false);
         setFailed(false);
         setPlaybackError(null);
         setPlaybackProxyStatus("idle");
+        setPlaybackJobId(null);
       })
       .catch((error) => {
         setPlaybackProxyStatus("error");
+        setPlaybackJobId(null);
         setPlaybackProxyError(String(error).replace(/^.*?: /, ""));
       });
+  };
+
+  const cancelPlayablePreview = () => {
+    if (playbackJobId) {
+      void invoke<boolean>("cancel_video_playback_proxy", { jobId: playbackJobId });
+    }
   };
 
   if (item.missing) {
     return <FileImage size={56} />;
   }
 
-  if (item.mediaType === "video" && item.fileSizeBytes === 0) {
+  if (item.contentStatus !== "available") {
     return (
       <div className="detail-preview-placeholder">
         <Film size={48} />
-        <span>This video file is empty or incomplete, so it has no playable preview.</span>
+        <span>{item.contentIssue ?? "This media file is empty or incomplete, so it has no preview."}</span>
       </div>
     );
   }
@@ -6014,9 +6148,21 @@ const DetailPreview = memo(function DetailPreview({ item }: { item: MediaFile })
           <div className="video-playback-message">
             <strong>Original video cannot play in the embedded viewer</strong>
             <span>{playbackError ?? "The browser could not decode this video's codec or container."}</span>
-            <button onClick={preparePlayablePreview} disabled={playbackProxyStatus === "generating"}>
-              {playbackProxyStatus === "generating" ? "Preparing playable preview…" : "Prepare playable preview"}
-            </button>
+            {playbackProxyStatus === "generating" ? (
+              <div className="playback-progress" aria-live="polite">
+                <progress max="100" value={playbackProgress?.percent ?? undefined} />
+                <span>
+                  {playbackProgress?.message ?? "Preparing playable preview…"}
+                  {playbackProgress?.percent !== null && playbackProgress?.percent !== undefined
+                    ? ` ${Math.round(playbackProgress.percent)}%`
+                    : ""}
+                  {playbackProgress?.elapsedSeconds ? ` · ${formatDuration(playbackProgress.elapsedSeconds)}` : ""}
+                </span>
+                <button onClick={cancelPlayablePreview}>Cancel conversion</button>
+              </div>
+            ) : (
+              <button onClick={preparePlayablePreview}>Prepare playable preview</button>
+            )}
             <small>Creates a cached 720p H.264/AAC copy for playback. The original file is not changed.</small>
             {playbackProxyError ? <span className="playback-error">Conversion failed: {playbackProxyError}</span> : null}
           </div>
@@ -6127,7 +6273,7 @@ const VideoThumbnail = memo(function VideoThumbnail({ item }: { item: MediaFile 
   const [failed, setFailed] = useState(false);
 
   useEffect(() => {
-    if (item.missing || !canVideoPreviewExtension(item.extension)) {
+    if (item.missing || item.contentStatus !== "available" || !canVideoPreviewExtension(item.extension)) {
       setThumbnailSrc(null);
       setFailed(false);
       return;
@@ -6238,7 +6384,7 @@ function useVideoMetadata(item: MediaFile | null) {
   });
 
   useEffect(() => {
-    if (!item || item.missing || item.mediaType !== "video" || !canVideoPreviewExtension(item.extension)) {
+    if (!item || item.missing || item.contentStatus !== "available" || item.mediaType !== "video" || !canVideoPreviewExtension(item.extension)) {
       setMetadata({
         durationSeconds: null,
         width: null,

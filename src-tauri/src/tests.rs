@@ -100,3 +100,73 @@ fn playback_proxy_cache_key_changes_when_source_changes() {
 
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn parses_avconvert_progress_and_rejects_noise() {
+    assert_eq!(parse_avconvert_progress("avconvert progress:  42.50% complete"), Some(42.5));
+    assert_eq!(parse_avconvert_progress("avconvert progress:  125.00% complete"), Some(100.0));
+    assert_eq!(parse_avconvert_progress("conversion started"), None);
+}
+
+#[test]
+fn playback_cache_stats_and_clear_stay_inside_owned_files() {
+    let root = unique_temp_dir("playback-cache-safety");
+    let db_path = root.join("database.sqlite");
+    let cache = playback_cache_dir(&db_path);
+    fs::create_dir_all(cache.join("nested")).unwrap();
+    fs::write(cache.join("ready.m4v"), b"ready").unwrap();
+    fs::write(cache.join("job.partial.m4v"), b"partial").unwrap();
+    fs::write(cache.join("keep.txt"), b"keep").unwrap();
+    fs::write(cache.join("nested").join("nested.m4v"), b"nested").unwrap();
+
+    let stats = playback_cache_stats(&db_path, 2).unwrap();
+    assert_eq!(stats.file_count, 1);
+    assert_eq!(stats.total_bytes, 5);
+    assert_eq!(stats.active_jobs, 2);
+
+    let cleared = clear_playback_cache_files(&db_path).unwrap();
+    assert_eq!(cleared.files_removed, 2);
+    assert_eq!(cleared.bytes_freed, 12);
+    assert!(cache.join("keep.txt").exists());
+    assert!(cache.join("nested").join("nested.m4v").exists());
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn scan_classifies_empty_media_and_repairs_it_when_content_arrives() {
+    let root = unique_temp_dir("empty-classification");
+    fs::create_dir_all(&root).unwrap();
+    let db_path = root.join("database.sqlite");
+    let source = root.join("empty.mp4");
+    fs::write(&source, []).unwrap();
+    let conn = Connection::open(&db_path).unwrap();
+    init_db(&conn).unwrap();
+    let mut index = HashMap::new();
+
+    cache_media_file(&conn, &mut index, &source, &root.to_string_lossy(), 1, 1, false).unwrap();
+    let (status, issue): (String, Option<String>) = conn
+        .query_row(
+            "SELECT content_status, content_issue FROM media_files WHERE path = ?1",
+            params![source.to_string_lossy().to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "empty");
+    assert!(issue.unwrap().contains("0 bytes"));
+
+    fs::write(&source, b"media content").unwrap();
+    cache_media_file(&conn, &mut index, &source, &root.to_string_lossy(), 2, 2, false).unwrap();
+    let (status, issue): (String, Option<String>) = conn
+        .query_row(
+            "SELECT content_status, content_issue FROM media_files WHERE path = ?1",
+            params![source.to_string_lossy().to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "available");
+    assert_eq!(issue, None);
+
+    drop(conn);
+    fs::remove_dir_all(root).unwrap();
+}

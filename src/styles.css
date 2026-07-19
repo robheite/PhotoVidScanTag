@@ -1418,6 +1418,23 @@ button:disabled {
   color: var(--status-danger-text);
 }
 
+.playback-progress {
+  display: grid;
+  gap: 5px;
+  width: 100%;
+}
+
+.playback-progress progress {
+  width: 100%;
+  height: 8px;
+  accent-color: var(--blue-600);
+}
+
+.playback-progress span {
+  color: var(--navy-900);
+  font-variant-numeric: tabular-nums;
+}
+
 .video-thumb-image {
   width: 100%;
   height: 100%;
@@ -1432,6 +1449,21 @@ button:disabled {
   height: 100%;
   background: linear-gradient(135deg, rgba(246, 245, 241, 0.92), rgba(223, 236, 234, 0.76));
   color: var(--blue-700);
+}
+
+.media-card.invalid-media {
+  border-color: var(--orange-600);
+}
+
+.thumb .content-issue-badge {
+  right: 6px;
+  bottom: 6px;
+  left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: #ffffff;
+  background: var(--orange-700);
 }
 
 .detail-copy,

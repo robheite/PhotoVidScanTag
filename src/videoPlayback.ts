@@ -16,3 +16,7 @@ export function describeVideoPlaybackError(code: number, nativeMessage?: string,
       return nativeMessage || "The embedded player reported an unknown media error.";
   }
 }
+
+export function playbackProgressMatchesJob(activeJobId: string | null, eventJobId: string): boolean {
+  return Boolean(activeJobId && activeJobId === eventJobId);
+}
