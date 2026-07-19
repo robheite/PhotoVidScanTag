@@ -1,224 +1,82 @@
-# MediaTagger macOS Build Track
+# MediaTagger macOS Releases
 
-This branch exists to keep macOS packaging, signing, notarization, and release flow separate from the Windows release line.
+`main` is the authoritative branch for the application on both Windows and macOS. The legacy `MAC` branch must not be used for new builds; keeping application code on separate platform branches allowed it to drift behind `main`.
 
-Current branch name: `MAC`
+## Install on Bekka's laptop
 
-## What we can prepare on Windows
+1. Open the matching version on the repository's **Releases** page.
+2. Download `MediaTagger-macOS-vX.Y.Z.zip`.
+3. Do not download GitHub's `Source code (zip)` or `Source code (tar.gz)` links.
+4. Extract the MediaTagger zip.
+5. Keep the app and installer together.
+6. Right-click **Install MediaTagger.command** and choose **Open**.
+7. Enter an administrator password only if macOS requires it to write to `/Applications`.
 
-From the Windows development machine we can safely do the following:
+The installer copies `MediaTagger.app` to `/Applications`, removes downloaded quarantine metadata, applies an ad-hoc local signature, verifies the bundle, and opens it. The destination laptop does not need Node.js, Rust, Git, Codex, or a source checkout.
 
-- keep the shared React + Rust codebase moving
-- generate shared icon assets
-- keep the Tauri bundle configuration ready for macOS
-- document the macOS build and release flow
-- prepare versioning and release notes
+Because this project is not enrolled in the paid Apple Developer Program, the package is not notarized. The initial right-click/Open step is therefore expected on a different Mac.
 
-## What still requires a Mac
+## Create a local transfer package
 
-An actual distributable macOS build still needs a Mac or a macOS CI runner for:
-
-- `tauri build` targeting macOS
-- code signing with an Apple Developer certificate
-- notarization with Apple
-- final validation of the `.app` and `.dmg`
-
-## Current macOS prep already done
-
-- Tauri bundle icons include `icon.icns`
-- macOS build scripts are available in `package.json`
-- helper script: [tools/tauri-build-macos.sh](/I:/PhotoVidScanTag/tools/tauri-build-macos.sh)
-- GitHub Actions workflow: [.github/workflows/macos-build.yml](/I:/PhotoVidScanTag/.github/workflows/macos-build.yml)
-
-## Recommended build flow on a Mac
-
-1. Install prerequisites:
-   - Xcode
-   - Xcode command line tools
-   - Node.js
-   - Rust
-
-2. Clone the repo and switch to the `MAC` branch.
-
-3. Install dependencies:
+On the development Mac:
 
 ```bash
-npm install
+npm ci
+npm test
+npm run package:macos-release
 ```
 
-4. Run an unsigned local build first:
+The package and SHA-256 checksum are created under `release/`. To repackage an already-built application without rebuilding it:
 
 ```bash
-npm run tauri:build:macos:unsigned
+npm run package:macos-release:existing
 ```
 
-5. Check the generated outputs under:
+The latter command is intended only when the release bundle was just built and verified from the current commit.
+
+## Publish a GitHub release
+
+Versions are stored in `package.json`, `package-lock.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`, and `src-tauri/Cargo.lock`.
+
+1. Set the new version in `package.json`.
+2. Synchronize and verify all version files:
 
 ```bash
-src-tauri/target/release/bundle
+npm run version:sync
+npm run version:check
 ```
 
-6. If macOS blocks the unsigned build on first run, clear quarantine and open it:
+3. Commit the version change to `main` and make sure CI passes.
+4. Create and push the matching tag, for example:
 
 ```bash
-xattr -dr com.apple.quarantine "src-tauri/target/release/bundle/macos/MediaTagger.app"
-open "src-tauri/target/release/bundle/macos/MediaTagger.app"
+git tag v1.1.8
+git push origin main v1.1.8
 ```
 
-7. If Finder still warns, right-click the app once and choose **Open**.
+The `macOS Build and Release` GitHub Actions workflow will:
 
-8. After unsigned output looks good, configure Apple signing/notarization on the Mac and run:
+- check out the exact tagged commit;
+- reject a tag that does not match the application version;
+- install locked dependencies with `npm ci`;
+- run the frontend and Rust test suites;
+- build the unsigned macOS app;
+- package the app with the installer and instructions;
+- upload the zip as a workflow artifact;
+- create the GitHub Release and attach the versioned Mac zip.
+
+A manual workflow run or an ordinary push to `main` builds a downloadable test artifact but does not create a public GitHub Release. Only a `vX.Y.Z` tag publishes a release.
+
+## Local installation while developing
+
+To build, install, verify, and optionally open the current source directly on the development Mac:
 
 ```bash
-npm run tauri:build:macos
+npm run install:macos-local:open
 ```
 
-## Exact local build steps from a downloaded source zip
+This is for development. Bekka's laptop should use the versioned release zip instead.
 
-If you download the source onto the Mac and want to build it there manually, use this exact sequence:
+## Signing limitation
 
-1. Download the source zip to the Mac.
-2. Double-click the zip in Finder so it extracts the project folder.
-3. Open **Terminal**:
-   - press `Command + Space`
-   - type `Terminal`
-   - press `Return`
-4. In Terminal, change into the extracted project folder.
-5. Change into the `tools` folder:
-
-```bash
-cd tools
-```
-
-6. Make the build helper executable:
-
-```bash
-chmod +x tauri-build-macos.sh
-```
-
-7. Run the helper:
-
-```bash
-./tauri-build-macos.sh
-```
-
-8. Wait for the build to finish.
-9. Open the generated bundle output under:
-
-```text
-src-tauri/target/release/bundle
-```
-
-10. Launch `MediaTagger.app`.
-11. If macOS blocks it on first run, run:
-
-```bash
-xattr -dr com.apple.quarantine "MediaTagger.app"
-open "MediaTagger.app"
-```
-
-## GitHub Actions path
-
-If you want the easiest first test without touching local Mac build tooling, use the GitHub Actions workflow on the `MAC` branch:
-
-1. Push changes to `MAC`, or run the workflow manually from the Actions tab.
-2. Open the `macOS Build` workflow run in GitHub.
-3. Under **Artifacts**, download `MediaTagger-macos-app`.
-4. Move the downloaded zip file onto the Mac.
-5. Double-click the zip so Finder extracts `MediaTagger.app`.
-6. Open **Terminal** on the Mac.
-7. In Terminal, change into the folder containing `MediaTagger.app`.
-8. Run:
-
-```bash
-xattr -dr com.apple.quarantine "MediaTagger.app"
-open "MediaTagger.app"
-```
-
-9. If the app still looks blocked, right-click it in Finder and choose **Open** once.
-
-### Important: do not use the wrong download
-
-If you are on the GitHub **Releases** page, GitHub also shows auto-generated files such as:
-
-- `Source code (zip)`
-- `Source code (tar.gz)`
-
-Those are only snapshots of the repository source code. They are **not** installable Mac app builds.
-
-For Mac testing, do **not** download:
-
-- `Source code (zip)`
-- `Source code (tar.gz)`
-- an unsigned `.dmg` from an older workflow run
-
-For unsigned GitHub testing, the correct file is:
-
-- `MediaTagger-macos-app`
-
-and inside that artifact, the thing you actually want is:
-
-- `MediaTagger.app.zip`
-
-## If you create a GitHub Release
-
-If you want the Mac tester to download from a GitHub **Release** page instead of the Actions page:
-
-1. First download the `MediaTagger-macos-app` artifact from the successful workflow run.
-2. Unzip that artifact on your own machine.
-3. Find `MediaTagger.app.zip` inside it.
-4. Create the GitHub release.
-5. In the release editor, use **Attach binaries by dropping them here or selecting them**.
-6. Upload `MediaTagger.app.zip` as a release asset.
-7. Tell the tester to download that uploaded release asset.
-
-Do **not** tell the tester to click:
-
-- `Source code (zip)`
-- `Source code (tar.gz)`
-
-Those files are automatically generated by GitHub and are only repository source snapshots.
-
-This workflow currently builds an unsigned macOS `.app` bundle for testing and zips it for download. That is the right first step before wiring in Apple signing and notarization.
-
-## Why the GitHub build may behave differently from a local Mac build
-
-Local Mac builds often launch more easily because they were created directly on the machine you are testing. A downloaded unsigned artifact from GitHub usually gets quarantined by macOS, which can make it fail to launch until quarantine is removed.
-
-Unsigned DMGs are especially fragile here and may show up as "damaged" even when the app itself is fine. For CI-based unsigned testing, prefer the zipped `.app` bundle instead of the DMG.
-
-That is a packaging/distribution behavior, not necessarily an app-core failure.
-
-## Signing / notarization checklist
-
-Before the signed build pass, make sure the Mac has:
-
-- an Apple Developer account with app signing access
-- a valid Developer ID Application certificate in Keychain
-- notarization credentials prepared for the chosen workflow
-- the final app identifier confirmed as:
-  - `com.robheite.mediatagger`
-
-## Suggested first macOS validation pass
-
-When we get onto a Mac, the first pass should be:
-
-1. Build unsigned
-2. Launch the app
-3. Verify:
-   - folder picking works
-   - scans run
-   - previews load
-   - duplicates review and cleanup behave
-   - move/copy preview and execution still behave
-   - exports write correctly
-4. Fix any platform-specific file-dialog or path behavior
-5. Then do signing and notarization
-
-## Distribution note
-
-Keeping the macOS work on `MAC` makes it easier to:
-
-- cut Mac-specific release notes
-- keep platform packaging changes isolated
-- merge shared app work back and forth without tangling release steps
+The workflow intentionally distributes a zipped `.app`, not an unsigned DMG. Without Apple Developer signing and notarization, unsigned DMGs are more likely to produce misleading “damaged” warnings. The packaged installer applies an ad-hoc signature locally, but it cannot replace Apple notarization or eliminate every first-launch security prompt.

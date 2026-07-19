@@ -11,10 +11,13 @@
     "test:frontend": "node --experimental-strip-types --test tests/*.test.ts",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
     "version:sync": "node tools/sync-version.mjs",
+    "version:check": "node tools/check-version.mjs",
     "tauri": "tauri",
     "tauri:dev:windows": "powershell -ExecutionPolicy Bypass -File tools/tauri-dev-windows.ps1",
     "tauri:build:macos": "bash tools/tauri-build-macos.sh",
     "tauri:build:macos:unsigned": "bash tools/tauri-build-macos.sh --unsigned",
+    "package:macos-release": "bash tools/package-macos-release.sh",
+    "package:macos-release:existing": "bash tools/package-macos-release.sh --skip-build",
     "install:macos-local": "bash tools/install-macos-local.sh",
     "install:macos-local:open": "bash tools/install-macos-local.sh --open"
   },

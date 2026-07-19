@@ -1,13 +1,15 @@
-name: macOS Build
+name: macOS Build and Release
 
 on:
   workflow_dispatch:
   push:
     branches:
-      - MAC
+      - main
+    tags:
+      - "v*"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build-macos:
@@ -27,48 +29,57 @@ jobs:
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install frontend dependencies
-        run: npm install
+      - name: Install dependencies
+        run: npm ci
 
-      - name: Build unsigned macOS app bundle
-        run: npm run tauri:build:macos:unsigned
-
-      - name: Package app bundle for download
+      - name: Verify version and release tag
         shell: bash
         run: |
           set -euo pipefail
-          APP_PATH="$(find src-tauri/target/release/bundle/macos -maxdepth 1 -name '*.app' | head -n 1)"
-          if [[ -z "${APP_PATH:-}" ]]; then
-            echo "No .app bundle found under src-tauri/target/release/bundle/macos"
+          VERSION="$(node -p "require('./package.json').version")"
+          npm run version:check
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" != "v${VERSION}" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match package version v${VERSION}."
             exit 1
           fi
-          ditto -c -k --keepParent "$APP_PATH" "${APP_PATH}.zip"
 
-      - name: Summarize unsigned macOS install steps
+      - name: Run tests
+        run: npm test
+
+      - name: Build packaged macOS download
+        run: npm run package:macos-release
+
+      - name: Upload macOS test artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MediaTagger-macOS
+          path: |
+            release/MediaTagger-macOS-*.zip
+            release/MediaTagger-macOS-*.zip.sha256
+          if-no-files-found: error
+
+      - name: Publish GitHub release asset
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ASSET="$(find release -maxdepth 1 -name 'MediaTagger-macOS-*.zip' -print -quit)"
+          gh release create "${GITHUB_REF_NAME}" "$ASSET" "$ASSET.sha256" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "MediaTagger ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --verify-tag
+
+      - name: Summarize installation
         shell: bash
         run: |
           {
-            echo "## Unsigned macOS test build"
+            echo "## MediaTagger macOS package"
             echo
-            echo "This workflow intentionally builds the unsigned \`.app\` bundle only, then zips it for download."
+            echo "Download the MediaTagger-macOS zip, extract it, then right-click **Install MediaTagger.command** and choose **Open**."
+            echo "The installer copies MediaTagger to Applications, applies an ad-hoc local signature, verifies it, and opens it."
             echo
-            echo "Do not rely on a DMG for unsigned CI testing. Use the zipped app bundle."
-            echo
-            echo "If macOS blocks launch on the test machine, run:"
-            echo
-            echo '```bash'
-            echo 'xattr -dr com.apple.quarantine "MediaTagger.app"'
-            echo 'open "MediaTagger.app"'
-            echo '```'
-            echo
-            echo "If Finder still warns, right-click the app and choose **Open** once."
+            echo "This build is not Apple-notarized. The first right-click/Open is expected on a different Mac."
           } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload macOS bundle artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: MediaTagger-macos-app
-          path: |
-            src-tauri/target/release/bundle/macos/*.app
-            src-tauri/target/release/bundle/macos/*.app.zip
-          if-no-files-found: error

@@ -59,76 +59,22 @@ or, once Apple signing/notarization is configured on the Mac:
 npm run tauri:build:macos
 ```
 
-See [MAC_BUILD.md](/I:/PhotoVidScanTag/MAC_BUILD.md) for the dedicated macOS branch workflow and release checklist.
+See [MAC_BUILD.md](MAC_BUILD.md) for the macOS package and release workflow.
 
-## macOS local build from downloaded source
+## macOS package and install
 
-If you download the repo source onto the Mac and want to build locally, use these exact steps:
+`main` is the authoritative source branch for both Windows and macOS. Do not build releases from the legacy `MAC` branch.
 
-1. Download the project source zip.
-2. Double-click the zip in Finder so it extracts the project folder.
-3. Open **Terminal**:
-   - press `Command + Space`
-   - type `Terminal`
-   - press `Return`
-4. In Terminal, change into the extracted project folder.
-5. Change into the `tools` folder:
+To create a ready-to-transfer Mac package locally:
 
 ```bash
-cd tools
+npm ci
+npm test
+npm run package:macos-release
 ```
 
-6. Make the Mac build helper executable:
+The versioned zip is written to `release/`. It contains `MediaTagger.app`, installation instructions, and a double-click installer that copies and verifies the app in `/Applications`.
 
-```bash
-chmod +x tauri-build-macos.sh
-```
+For another Mac, download the matching `MediaTagger-macOS-vX.Y.Z.zip` asset from the GitHub Release—not GitHub's automatically generated source-code archives. Extract it, then right-click **Install MediaTagger.command** and choose **Open**. Node.js, Rust, Codex, and the source repository are not needed on the destination laptop.
 
-7. Run the helper:
-
-```bash
-./tauri-build-macos.sh
-```
-
-8. Wait for the build to finish.
-9. When it completes, go to:
-
-```text
-src-tauri/target/release/bundle
-```
-
-10. Open `MediaTagger.app` from the generated bundle output.
-11. If macOS blocks the app on first run, in Terminal run:
-
-```bash
-xattr -dr com.apple.quarantine "MediaTagger.app"
-open "MediaTagger.app"
-```
-
-## macOS test install from GitHub
-
-Use these exact steps for an unsigned Mac test build:
-
-1. Open the repo on GitHub.
-2. Click **Actions**.
-3. Click **macOS Build**.
-4. Open the newest successful run for branch `MAC`.
-5. Scroll to **Artifacts**.
-6. Click **MediaTagger-macos-app** to download it.
-7. Move the downloaded zip to the Mac.
-8. Double-click the zip so it extracts `MediaTagger.app`.
-9. Open **Terminal** on the Mac.
-10. Change into the folder containing `MediaTagger.app`.
-11. Run:
-
-```bash
-xattr -dr com.apple.quarantine "MediaTagger.app"
-open "MediaTagger.app"
-```
-
-12. If macOS still warns, right-click `MediaTagger.app` in Finder and choose **Open** once.
-
-Important:
-- Do **not** use the GitHub release auto-generated `Source code (zip)` file for testing the Mac app.
-- Do **not** use the unsigned DMG from older runs.
-- For unsigned GitHub test builds, use the `MediaTagger-macos-app` artifact zip only.
+See [MAC_BUILD.md](MAC_BUILD.md) for versioning, GitHub release, and unsigned-app details.
