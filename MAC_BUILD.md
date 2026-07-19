@@ -16,6 +16,18 @@ The installer copies `MediaTagger.app` to `/Applications`, removes downloaded qu
 
 Because this project is not enrolled in the paid Apple Developer Program, the package is not notarized. The initial right-click/Open step is therefore expected on a different Mac.
 
+## Most reliable update path on Bekka's personal Mac
+
+Because that Mac already has Node.js, Rust, Xcode tools, and a working source checkout, use the local updater when avoiding Gatekeeper friction matters most:
+
+1. Keep one clean clone of this repository on the laptop.
+2. In its `tools` folder, double-click `update-install-macos.command`.
+3. If Finder asks the first time, right-click the updater and choose **Open**.
+
+The updater refuses to overwrite uncommitted work, switches to the authoritative `main` branch, pulls only a fast-forward update, installs locked dependencies, verifies versions, runs all tests, builds locally, installs the app in `/Applications`, verifies it, and opens it.
+
+Because the application is compiled on that laptop rather than downloaded as an unsigned binary, this route avoids the downloaded-app quarantine behavior. It takes longer than installing the release zip but is the cleanest unsigned deployment available without Apple notarization.
+
 ## Create a local transfer package
 
 On the development Mac:
@@ -76,6 +88,8 @@ npm run install:macos-local:open
 ```
 
 This is for development. Bekka's laptop should use the versioned release zip instead.
+
+On Bekka's already-configured personal laptop, `tools/update-install-macos.command` is preferred when maximum Gatekeeper reliability is more important than download speed.
 
 ## Signing limitation
 

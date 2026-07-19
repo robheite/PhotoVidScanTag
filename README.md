@@ -77,4 +77,6 @@ The versioned zip is written to `release/`. It contains `MediaTagger.app`, insta
 
 For another Mac, download the matching `MediaTagger-macOS-vX.Y.Z.zip` asset from the GitHub Release—not GitHub's automatically generated source-code archives. Extract it, then right-click **Install MediaTagger.command** and choose **Open**. Node.js, Rust, Codex, and the source repository are not needed on the destination laptop.
 
+If the destination Mac already has the build tools and a clean repository clone, double-click `tools/update-install-macos.command` instead. It updates from `main`, tests, builds locally, installs into `/Applications`, and avoids downloaded-app quarantine issues.
+
 See [MAC_BUILD.md](MAC_BUILD.md) for versioning, GitHub release, and unsigned-app details.
