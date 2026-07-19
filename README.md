@@ -16,7 +16,7 @@ See [PROJECT_PLAN.md](PROJECT_PLAN.md) for the development roadmap and product d
 
 Prerequisites:
 
-- Node.js 20+
+- Node.js 22.6+ (Node.js 24 recommended)
 - npm
 - Rust toolchain, required for Tauri desktop builds
 
