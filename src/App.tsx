@@ -1,6 +1,8 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import { applyMediaSelection, type SelectionModifiers } from "./selection";
+import { describeVideoPlaybackError } from "./videoPlayback";
 import {
   AlertCircle,
   CalendarClock,
@@ -270,11 +272,6 @@ type MoveCollisionPolicy = "skip" | "rename";
 type DuplicateCleanupMode = "move" | "delete";
 type SplitSection = "Scan" | "Library" | "Duplicates" | "Move/Copy" | "Settings";
 type MediaTypeFilter = "all" | "image" | "video";
-type SelectionModifiers = {
-  metaKey: boolean;
-  ctrlKey: boolean;
-  shiftKey: boolean;
-};
 type MissingFilterMode = "hide" | "include" | "only";
 type TagMatchMode = "any" | "all";
 type DateSourceFilter = "all" | "metadata" | "filesystem-created" | "filesystem-modified" | "unknown";
@@ -344,6 +341,8 @@ const nativeImagePreviewCache = new Map<string, string | null>();
 const nativeImagePreviewInflight = new Map<string, Promise<string | null>>();
 const nativeVideoPreviewCache = new Map<string, string | null>();
 const nativeVideoPreviewInflight = new Map<string, Promise<string | null>>();
+const videoPlaybackProxyCache = new Map<string, string>();
+const videoPlaybackProxyInflight = new Map<string, Promise<string>>();
 const imageMetadataHydrationAttempts = new Set<number>();
 const videoThumbnailQueue: LimitedQueue = { active: 0, limit: 2, pending: [] };
 const videoMetadataQueue: LimitedQueue = { active: 0, limit: 2, pending: [] };
@@ -2744,27 +2743,11 @@ function App() {
 
   function activateMediaFile(fileId: number, collection: MediaFile[], modifiers?: SelectionModifiers) {
     setActiveMediaId(fileId);
-
-    const additive = Boolean(modifiers?.metaKey || modifiers?.ctrlKey);
-    if (modifiers?.shiftKey && selectionAnchorIdRef.current !== null) {
-      const anchorIndex = collection.findIndex((item) => item.id === selectionAnchorIdRef.current);
-      const targetIndex = collection.findIndex((item) => item.id === fileId);
-      if (anchorIndex >= 0 && targetIndex >= 0) {
-        const [start, end] = anchorIndex <= targetIndex ? [anchorIndex, targetIndex] : [targetIndex, anchorIndex];
-        const rangeIds = collection.slice(start, end + 1).filter((item) => !item.missing).map((item) => item.id);
-        setSelectedFileIds((currentIds) => additive ? [...new Set([...currentIds, ...rangeIds])] : rangeIds);
-        return;
-      }
-    }
-
-    selectionAnchorIdRef.current = fileId;
-    if (additive) {
-      setSelectedFileIds((currentIds) =>
-        currentIds.includes(fileId) ? currentIds.filter((id) => id !== fileId) : [...currentIds, fileId]
-      );
-    } else {
-      setSelectedFileIds([fileId]);
-    }
+    setSelectedFileIds((currentIds) => {
+      const transition = applyMediaSelection(currentIds, selectionAnchorIdRef.current, fileId, collection, modifiers);
+      selectionAnchorIdRef.current = transition.anchorId;
+      return transition.selectedIds;
+    });
   }
 
   function selectDuplicateGroup() {
@@ -5854,6 +5837,26 @@ function loadNativeVideoPreview(path: string): Promise<string | null> {
   return previewPromise;
 }
 
+function loadVideoPlaybackProxy(path: string): Promise<string> {
+  const cached = videoPlaybackProxyCache.get(path);
+  if (cached) {
+    return Promise.resolve(cached);
+  }
+  const inflight = videoPlaybackProxyInflight.get(path);
+  if (inflight) {
+    return inflight;
+  }
+
+  const proxyPromise = invoke<string>("generate_video_playback_proxy", { path }).then((proxyPath) => {
+    const proxySrc = convertFileSrc(proxyPath);
+    videoPlaybackProxyCache.set(path, proxySrc);
+    return proxySrc;
+  });
+  videoPlaybackProxyInflight.set(path, proxyPromise);
+  void proxyPromise.finally(() => videoPlaybackProxyInflight.delete(path));
+  return proxyPromise;
+}
+
 function testImagePreview(path: string): Promise<boolean> {
   return new Promise((resolve) => {
     const image = new Image();
@@ -5919,6 +5922,12 @@ const PreviewImage = memo(function PreviewImage({ item }: { item: MediaFile }) {
 const DetailPreview = memo(function DetailPreview({ item }: { item: MediaFile }) {
   const [failed, setFailed] = useState(false);
   const [nativePreviewSrc, setNativePreviewSrc] = useState<string | null>(null);
+  const [playbackProxySrc, setPlaybackProxySrc] = useState<string | null>(null);
+  const [playbackProxyStatus, setPlaybackProxyStatus] = useState<"idle" | "generating" | "error">("idle");
+  const [playbackError, setPlaybackError] = useState<string | null>(null);
+  const [playbackProxyError, setPlaybackProxyError] = useState<string | null>(null);
+  const [playbackReady, setPlaybackReady] = useState(false);
+  const playbackMetadata = useVideoMetadata(item);
   const needsNativeImagePreview = !item.missing && canNativePreviewExtension(item.extension);
   const needsNativeVideoPreview = !item.missing && item.mediaType === "video" && canVideoPreviewExtension(item.extension);
 
@@ -5931,6 +5940,11 @@ const DetailPreview = memo(function DetailPreview({ item }: { item: MediaFile })
     }
 
     setFailed(false);
+    setPlaybackError(null);
+    setPlaybackProxyError(null);
+    setPlaybackProxyStatus("idle");
+    setPlaybackProxySrc(videoPlaybackProxyCache.get(item.path) ?? null);
+    setPlaybackReady(false);
     setNativePreviewSrc(
       needsNativeVideoPreview
         ? nativeVideoPreviewCache.get(item.path) ?? null
@@ -5947,6 +5961,38 @@ const DetailPreview = memo(function DetailPreview({ item }: { item: MediaFile })
     };
   }, [item.path, needsNativeImagePreview, needsNativeVideoPreview]);
 
+  useEffect(() => {
+    if (!needsNativeVideoPreview || failed || playbackReady) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      setPlaybackError(
+        playbackProxySrc
+          ? "The compatible playback copy did not become ready in the embedded player."
+          : "The original video did not become ready within 12 seconds. Its bitrate, codec profile, or container may not be compatible with the embedded player."
+      );
+      setFailed(true);
+    }, 12_000);
+    return () => window.clearTimeout(timer);
+  }, [failed, needsNativeVideoPreview, playbackProxySrc, playbackReady]);
+
+  const preparePlayablePreview = () => {
+    setPlaybackProxyStatus("generating");
+    setPlaybackProxyError(null);
+    void loadVideoPlaybackProxy(item.path)
+      .then((proxySrc) => {
+        setPlaybackProxySrc(proxySrc);
+        setPlaybackReady(false);
+        setFailed(false);
+        setPlaybackError(null);
+        setPlaybackProxyStatus("idle");
+      })
+      .catch((error) => {
+        setPlaybackProxyStatus("error");
+        setPlaybackProxyError(String(error).replace(/^.*?: /, ""));
+      });
+  };
+
   if (item.missing) {
     return <FileImage size={56} />;
   }
@@ -5961,25 +6007,44 @@ const DetailPreview = memo(function DetailPreview({ item }: { item: MediaFile })
   }
 
   if (item.mediaType === "video" && canVideoPreviewExtension(item.extension)) {
-    if (failed) {
-      return nativePreviewSrc ? (
-        <img src={nativePreviewSrc} alt="Video thumbnail" loading="lazy" />
-      ) : (
-        <div className="detail-preview-placeholder">
-          <Film size={48} />
-          <span>This video cannot be played here. The original file is unchanged.</span>
+    if (failed && !playbackProxySrc) {
+      return (
+        <div className="video-playback-fallback">
+          {nativePreviewSrc ? <img src={nativePreviewSrc} alt="Video thumbnail" loading="lazy" /> : <Film size={48} />}
+          <div className="video-playback-message">
+            <strong>Original video cannot play in the embedded viewer</strong>
+            <span>{playbackError ?? "The browser could not decode this video's codec or container."}</span>
+            <button onClick={preparePlayablePreview} disabled={playbackProxyStatus === "generating"}>
+              {playbackProxyStatus === "generating" ? "Preparing playable preview…" : "Prepare playable preview"}
+            </button>
+            <small>Creates a cached 720p H.264/AAC copy for playback. The original file is not changed.</small>
+            {playbackProxyError ? <span className="playback-error">Conversion failed: {playbackProxyError}</span> : null}
+          </div>
         </div>
       );
     }
     return (
       <video
-        src={convertFileSrc(item.path)}
+        src={playbackProxySrc ?? convertFileSrc(item.path)}
         poster={nativePreviewSrc ?? undefined}
         controls
         muted
         playsInline
         preload="metadata"
-        onError={() => setFailed(true)}
+        onLoadedMetadata={() => setPlaybackReady(true)}
+        onCanPlay={() => setPlaybackReady(true)}
+        onError={(event) => {
+          const mediaError = event.currentTarget.error;
+          setPlaybackError(
+            describeVideoPlaybackError(mediaError?.code ?? 0, mediaError?.message, playbackMetadata.codec)
+          );
+          setFailed(true);
+          if (playbackProxySrc) {
+            setPlaybackProxySrc(null);
+            videoPlaybackProxyCache.delete(item.path);
+            setPlaybackProxyError("The generated H.264/AAC preview was also rejected by the embedded player.");
+          }
+        }}
       />
     );
   }

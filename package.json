@@ -7,6 +7,9 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
+    "test": "npm run test:frontend && npm run test:rust",
+    "test:frontend": "node --experimental-strip-types --test tests/*.test.ts",
+    "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
     "version:sync": "node tools/sync-version.mjs",
     "tauri": "tauri",
     "tauri:dev:windows": "powershell -ExecutionPolicy Bypass -File tools/tauri-dev-windows.ps1",
@@ -29,6 +32,6 @@
     "@vitejs/plugin-react": "^6.0.2",
     "playwright": "^1.60.0",
     "typescript": "^5.5.3",
-    "vite": "^8.0.14"
+    "vite": "^8.1.5"
   }
 }

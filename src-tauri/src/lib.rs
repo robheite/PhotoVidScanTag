@@ -14,6 +14,9 @@ use sha2::{Digest, Sha256};
 use tauri::{Emitter, Manager, State};
 use walkdir::WalkDir;
 
+#[cfg(test)]
+mod tests;
+
 struct AppState {
     db_path: Mutex<PathBuf>,
 }
@@ -2205,6 +2208,23 @@ async fn generate_native_video_preview(
 }
 
 #[tauri::command]
+async fn generate_video_playback_proxy(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let db_path = state
+        .db_path
+        .lock()
+        .map_err(|_| "Database state is unavailable".to_string())?
+        .clone();
+    let video_path = PathBuf::from(path);
+
+    tauri::async_runtime::spawn_blocking(move || build_video_playback_proxy(&video_path, &db_path))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
 async fn read_video_metadata_details(path: String) -> Result<VideoMetadataDetails, String> {
     let video_path = PathBuf::from(path);
     tauri::async_runtime::spawn_blocking(move || read_native_video_metadata(&video_path))
@@ -2709,6 +2729,29 @@ fn preview_cache_dir(db_path: &Path) -> PathBuf {
         .join("preview-cache")
 }
 
+fn playback_cache_dir(db_path: &Path) -> PathBuf {
+    db_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("playback-cache")
+}
+
+fn playback_proxy_cache_path(db_path: &Path, path: &Path) -> Result<PathBuf, String> {
+    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(system_time_to_unix)
+        .unwrap_or_default();
+    let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let mut hasher = Sha256::new();
+    hasher.update(canonical_path.to_string_lossy().as_bytes());
+    hasher.update(modified.to_le_bytes());
+    hasher.update(metadata.len().to_le_bytes());
+    hasher.update(b"mac-avconvert-apple-m4v-720p-v1");
+    Ok(playback_cache_dir(db_path).join(format!("{:x}.m4v", hasher.finalize())))
+}
+
 fn native_preview_cache_path(
     db_path: &Path,
     path: &Path,
@@ -2962,6 +3005,74 @@ fn build_native_video_preview(
     fs::create_dir_all(preview_cache_dir(db_path)).map_err(|error| error.to_string())?;
     generate_native_video_preview_file(path, &cache_path, max_dimension)?;
     Ok(Some(cache_path.to_string_lossy().to_string()))
+}
+
+#[cfg(target_os = "macos")]
+fn build_video_playback_proxy(path: &Path, db_path: &Path) -> Result<String, String> {
+    if !path.exists() {
+        return Err("The source video is no longer available".to_string());
+    }
+    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.is_file() {
+        return Err("The playback source is not a regular file".to_string());
+    }
+    if metadata.len() == 0 {
+        return Err("The source video is empty or incomplete".to_string());
+    }
+
+    let cache_path = playback_proxy_cache_path(db_path, path)?;
+    if cache_path.exists() && fs::metadata(&cache_path).map(|value| value.len() > 0).unwrap_or(false) {
+        return Ok(cache_path.to_string_lossy().to_string());
+    }
+
+    fs::create_dir_all(playback_cache_dir(db_path)).map_err(|error| error.to_string())?;
+    let partial_path = cache_path.with_extension("partial.m4v");
+    let _ = fs::remove_file(&partial_path);
+    let mut child = std::process::Command::new("avconvert")
+        .args(["--source"])
+        .arg(path)
+        .args(["--output"])
+        .arg(&partial_path)
+        .args([
+            "--preset",
+            "PresetAppleM4V720pHD",
+            "--replace",
+        ])
+        .spawn()
+        .map_err(|error| format!("Unable to start the macOS video converter: {error}"))?;
+
+    let started_at = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            break status;
+        }
+        if started_at.elapsed() >= Duration::from_secs(15 * 60) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&partial_path);
+            return Err("Playable-preview conversion timed out after 15 minutes".to_string());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+
+    if !status.success() {
+        let _ = fs::remove_file(&partial_path);
+        return Err(format!(
+            "macOS could not convert this video's codec or container (converter status {status})"
+        ));
+    }
+    if !partial_path.exists() || fs::metadata(&partial_path).map(|value| value.len() == 0).unwrap_or(true) {
+        let _ = fs::remove_file(&partial_path);
+        return Err("macOS completed conversion without producing a playable preview".to_string());
+    }
+
+    fs::rename(&partial_path, &cache_path).map_err(|error| error.to_string())?;
+    Ok(cache_path.to_string_lossy().to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn build_video_playback_proxy(_path: &Path, _db_path: &Path) -> Result<String, String> {
+    Err("Automatic playable-preview conversion is currently available on macOS only".to_string())
 }
 
 #[cfg(target_os = "windows")]
@@ -3725,6 +3836,7 @@ pub fn run() {
             hydrate_media_dimensions,
             generate_native_image_preview,
             generate_native_video_preview,
+            generate_video_playback_proxy,
             read_video_metadata_details,
             open_file_path,
             open_file_location,
