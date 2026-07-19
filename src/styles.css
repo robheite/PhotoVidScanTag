@@ -1142,6 +1142,15 @@ button:disabled {
   min-height: 0;
 }
 
+.library-main.list-only {
+  overflow: hidden;
+}
+
+.library-main.list-only .library-table-shell {
+  flex: 1 1 auto;
+  min-height: 240px;
+}
+
 .library-table-shell .data-grid {
   height: 100%;
   min-height: 0;

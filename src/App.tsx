@@ -735,7 +735,6 @@ function App() {
   const [libraryPageSize, setLibraryPageSize] = useState<number>(50);
   const [libraryPage, setLibraryPage] = useState<number>(1);
   const [libraryTableOpen, setLibraryTableOpen] = useState(false);
-  const [libraryTableHeight, setLibraryTableHeight] = useState<number>(320);
   const [scanTableHeight, setScanTableHeight] = useState<number>(320);
   const [activeMediaId, setActiveMediaId] = useState<number | null>(null);
   const [magnifiedMediaId, setMagnifiedMediaId] = useState<number | null>(null);
@@ -774,7 +773,6 @@ function App() {
   const [skipDeleteWarningThisSession, setSkipDeleteWarningThisSession] = useState(false);
   const [skipDeleteWarningDraft, setSkipDeleteWarningDraft] = useState(false);
   const detailResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
-  const libraryTableResizeRef = useRef<{ startY: number; startHeight: number } | null>(null);
   const scanTableResizeRef = useRef<{ startY: number; startHeight: number } | null>(null);
   const [panelSplitWidths, setPanelSplitWidths] = useState<Record<SplitSection, number>>({
     Scan: 320,
@@ -936,13 +934,6 @@ function App() {
         return;
       }
 
-      if (libraryTableResizeRef.current) {
-        const delta = libraryTableResizeRef.current.startY - event.clientY;
-        const nextHeight = Math.min(640, Math.max(160, libraryTableResizeRef.current.startHeight + delta));
-        setLibraryTableHeight(nextHeight);
-        return;
-      }
-
       if (scanTableResizeRef.current) {
         const delta = scanTableResizeRef.current.startY - event.clientY;
         const nextHeight = Math.min(640, Math.max(160, scanTableResizeRef.current.startHeight + delta));
@@ -969,7 +960,6 @@ function App() {
 
     const handleMouseUp = () => {
       gridResizeRef.current = null;
-      libraryTableResizeRef.current = null;
       scanTableResizeRef.current = null;
       detailResizeRef.current = null;
       splitResizeRef.current = null;
@@ -1512,15 +1502,6 @@ function App() {
       startWidth: gridColumnWidths[set][index]
     };
     document.body.style.cursor = "col-resize";
-    document.body.style.userSelect = "none";
-  }
-
-  function beginLibraryTableResize(clientY: number) {
-    libraryTableResizeRef.current = {
-      startY: clientY,
-      startHeight: libraryTableHeight
-    };
-    document.body.style.cursor = "row-resize";
     document.body.style.userSelect = "none";
   }
 
@@ -4889,7 +4870,7 @@ function App() {
                   : undefined
               }
             >
-              <div className="library-main">
+              <div className={`library-main ${activeSection === "Library" && libraryTableOpen ? "list-only" : ""}`}>
                     {activeSection !== "Library" || !libraryTableOpen ? <VirtualMediaGrid
                       items={activePreviewFiles}
                       width={activeThumbnailDimensions.width}
@@ -4959,25 +4940,7 @@ function App() {
 
                 {activeSection !== "Library" || libraryTableOpen ? (
                   <>
-                    {activeSection === "Library" ? (
-                      <div
-                        className="library-table-resize-rail"
-                        role="separator"
-                        tabIndex={0}
-                        aria-label="Resize file list panel"
-                        aria-orientation="horizontal"
-                        aria-valuemin={160}
-                        aria-valuemax={640}
-                        aria-valuenow={libraryTableHeight}
-                        onKeyDown={(event) => {
-                          if (event.key === "ArrowUp" || event.key === "ArrowDown") {
-                            event.preventDefault();
-                            setLibraryTableHeight((current) => Math.min(640, Math.max(160, current + (event.key === "ArrowUp" ? 16 : -16))));
-                          }
-                        }}
-                        onMouseDown={(event) => beginLibraryTableResize(event.clientY)}
-                      />
-                    ) : activeSection === "Scan" ? (
+                    {activeSection === "Scan" ? (
                       <div
                         className="scan-table-resize-rail"
                         role="separator"
@@ -5006,7 +4969,7 @@ function App() {
                       }
                       style={
                         activeSection === "Library"
-                          ? { height: `${libraryTableHeight}px` }
+                          ? undefined
                           : activeSection === "Scan"
                             ? { height: `${scanTableHeight}px` }
                             : undefined
