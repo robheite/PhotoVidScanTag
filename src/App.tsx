@@ -5866,10 +5866,27 @@ const DetailPreview = memo(function DetailPreview({ item }: { item: MediaFile })
   }
 
   if (item.mediaType === "video" && canVideoPreviewExtension(item.extension)) {
-    if (failed && nativePreviewSrc) {
-      return <img src={nativePreviewSrc} alt="" loading="lazy" />;
+    if (failed) {
+      return nativePreviewSrc ? (
+        <img src={nativePreviewSrc} alt="Video thumbnail" loading="lazy" />
+      ) : (
+        <div className="detail-preview-placeholder">
+          <Film size={48} />
+          <span>This video cannot be played here. The original file is unchanged.</span>
+        </div>
+      );
     }
-    return <video src={convertFileSrc(item.path)} controls muted preload="metadata" onError={() => setFailed(true)} />;
+    return (
+      <video
+        src={convertFileSrc(item.path)}
+        poster={nativePreviewSrc ?? undefined}
+        controls
+        muted
+        playsInline
+        preload="metadata"
+        onError={() => setFailed(true)}
+      />
+    );
   }
 
   if (needsNativeImagePreview && nativePreviewSrc && !failed) {
